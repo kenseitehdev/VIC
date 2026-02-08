@@ -1003,9 +1003,93 @@ static void paste_text_at_cursor(ViewerState *st, const char *text) {
 // For brevity of the "fixed file", I’m leaving it unchanged.
 // Paste your existing delete_range_to_match() right here.
 static void delete_range_to_match(ViewerState *st, int aL, int aC, int bL, int bC, int also_yank) {
-    // --- KEEP YOUR EXISTING IMPLEMENTATION HERE (unchanged) ---
-    // (I’m not altering it; it wasn’t part of the picker/fallback breakage.)
-    (void)st; (void)aL; (void)aC; (void)bL; (void)bC; (void)also_yank;
+    Buffer *b = &st->buffers[st->current_buffer];
+    int sL=aL, sC=aC, eL=bL, eC=bC;
+    if (sL > eL || (sL==eL && sC > eC)) {
+        int tL=sL,tC=sC; sL=eL; sC=eC; eL=tL; eC=tC;
+    }
+    size_t cap = 4096, len = 0;
+    char *tmp = (char*)malloc(cap);
+    if (!tmp) return;
+    tmp[0] = '\0';
+    for (int L = sL; L <= eL; L++) {
+        const char *line = b->lines[L];
+        int line_len = (int)strlen(line);
+        int start = (L==sL) ? sC : 0;
+        int end   = (L==eL) ? eC : (line_len-1);
+        if (start < 0) start = 0;
+        if (start > line_len) start = line_len;
+        if (end < -1) end = -1;
+        if (end >= line_len) end = line_len-1;
+        if (end >= start) {
+            int chunk = end - start + 1;
+            if (len + (size_t)chunk + 2 >= cap) {
+                while (len + (size_t)chunk + 2 >= cap) cap *= 2;
+                char *nb = (char*)realloc(tmp, cap);
+                if (!nb) { free(tmp); return; }
+                tmp = nb;
+            }
+            memcpy(tmp + len, line + start, (size_t)chunk);
+            len += (size_t)chunk;
+            tmp[len] = '\0';
+        }
+        if (L != eL) {
+            if (len + 2 >= cap) { cap *= 2; char *nb=(char*)realloc(tmp, cap); if(!nb){free(tmp);return;} tmp=nb; }
+            tmp[len++] = '\n';
+            tmp[len] = '\0';
+        }
+    }
+    if (also_yank) clipboard_copy_text(tmp);
+    undo_push(b);
+    if (sL == eL) {
+        char *line = b->lines[sL];
+        int line_len = (int)strlen(line);
+        if (sC < 0) sC = 0;
+        if (eC >= line_len) eC = line_len - 1;
+        if (eC >= sC) {
+            int new_len = line_len - (eC - sC + 1);
+            char *nl = (char*)malloc((size_t)new_len + 1);
+            memcpy(nl, line, (size_t)sC);
+            memcpy(nl + sC, line + eC + 1, (size_t)(line_len - (eC + 1) + 1));
+            free(b->lines[sL]);
+            b->lines[sL] = nl;
+        }
+        st->cursor_line = sL;
+        st->cursor_col = sC;
+        ensure_cursor_bounds(st);
+        free(tmp);
+        return;
+    }
+    char *start_line = b->lines[sL];
+    char *end_line   = b->lines[eL];
+    int slen = (int)strlen(start_line);
+    int elen = (int)strlen(end_line);
+    if (sC < 0) sC = 0;
+    if (sC > slen) sC = slen;
+    if (eC < -1) eC = -1;
+    if (eC >= elen) eC = elen - 1;
+    const char *prefix = start_line;
+    int prefix_len = sC;
+    const char *suffix = (eC + 1 <= elen) ? (end_line + eC + 1) : (end_line + elen);
+    int suffix_len = (int)strlen(suffix);
+    char *joined = (char*)malloc((size_t)prefix_len + (size_t)suffix_len + 1);
+    memcpy(joined, prefix, (size_t)prefix_len);
+    memcpy(joined + prefix_len, suffix, (size_t)suffix_len);
+    joined[prefix_len + suffix_len] = '\0';
+    for (int L = sL; L <= eL; L++) free(b->lines[L]);
+    int dst = sL + 1;
+    int src = eL + 1;
+    while (src < b->line_count) {
+        b->lines[dst++] = b->lines[src++];
+    }
+    b->lines[sL] = joined;
+    int new_count = dst;
+    for (int i = new_count; i < b->line_count; i++) b->lines[i] = NULL;
+    b->line_count = new_count;
+    st->cursor_line = sL;
+    st->cursor_col = sC;
+    ensure_cursor_bounds(st);
+    free(tmp);
 }
 
 static void close_current_buffer(ViewerState *st) {
@@ -1715,9 +1799,116 @@ static void exit_command_mode(ViewerState *st) {
 }
 
 static void cmd_show_help(ViewerState *st) {
-    // keep your existing help implementation; unchanged
-    (void)st;
-    set_status(st, "Help: (keep your existing cmd_show_help)");
+    int have_nfzf = check_command_exists("nfzf");
+    int have_fzf = check_command_exists("fzf");
+    
+    if (!have_nfzf && !have_fzf) {
+        set_status(st, "fzf or nfzf required for help menu");
+        return;
+    }
+
+    char help_template[] = "/tmp/nbl_vic_help_XXXXXX";
+    int fd = mkstemp(help_template);
+    if (fd < 0) {
+        set_status(st, "Failed to create temp file");
+        return;
+    }
+
+    FILE *help_file = fdopen(fd, "w");
+    if (!help_file) {
+        close(fd);
+        unlink(help_template);
+        set_status(st, "Failed to open temp file");
+        return;
+    }
+
+    fprintf(help_file, "=== NAVIGATION ===\n");
+    fprintf(help_file, "h / LEFT        | Move cursor left\n");
+    fprintf(help_file, "j / DOWN        | Move cursor down\n");
+    fprintf(help_file, "k / UP          | Move cursor up\n");
+    fprintf(help_file, "l / RIGHT       | Move cursor right\n");
+    fprintf(help_file, "gg              | Jump to first line\n");
+    fprintf(help_file, "G               | Jump to last line\n");
+    fprintf(help_file, "%%               | Jump to matching bracket\n");
+    fprintf(help_file, "Ctrl+D          | Half page down\n");
+    fprintf(help_file, "Ctrl+U          | Half page up\n");
+    fprintf(help_file, "Ctrl+E          | Scroll down one line\n");
+    fprintf(help_file, "Ctrl+Y          | Scroll up one line\n");
+    fprintf(help_file, "\n");
+    fprintf(help_file, "=== EDITING ===\n");
+    fprintf(help_file, "i               | Enter insert mode\n");
+    fprintf(help_file, "ESC             | Exit insert mode / clear search\n");
+    fprintf(help_file, "u               | Undo\n");
+    fprintf(help_file, "Ctrl+R          | Redo\n");
+    fprintf(help_file, "yy              | Yank (copy) current line\n");
+    fprintf(help_file, "y%%              | Yank to matching bracket\n");
+    fprintf(help_file, "dd              | Delete current line\n");
+    fprintf(help_file, "d%%              | Delete to matching bracket\n");
+    fprintf(help_file, "p               | Paste from clipboard\n");
+    fprintf(help_file, "\n");
+    fprintf(help_file, "=== VISUAL MODE ===\n");
+    fprintf(help_file, "V               | Enter visual line mode\n");
+    fprintf(help_file, "y (in visual)   | Yank selected lines\n");
+    fprintf(help_file, "ESC (in visual) | Exit visual mode\n");
+    fprintf(help_file, "\n");
+    fprintf(help_file, "=== SEARCH ===\n");
+    fprintf(help_file, "/               | Search forward\n");
+    fprintf(help_file, "n               | Next search match\n");
+    fprintf(help_file, "N               | Previous search match\n");
+    fprintf(help_file, ":noh            | Clear search highlighting\n");
+    fprintf(help_file, "\n");
+    fprintf(help_file, "=== BUFFERS ===\n");
+    fprintf(help_file, ":ls             | List and switch buffers (fzf)\n");
+    fprintf(help_file, ":b new          | Create new blank buffer\n");
+    fprintf(help_file, ":b add / :b a   | Add file to buffer (fzf picker)\n");
+    fprintf(help_file, ":b n            | Next buffer\n");
+    fprintf(help_file, ":b p            | Previous buffer\n");
+    fprintf(help_file, ":b <num>        | Switch to buffer number\n");
+    fprintf(help_file, "gt              | Next buffer (when g pending)\n");
+    fprintf(help_file, "gT              | Previous buffer (when g pending)\n");
+    fprintf(help_file, "x               | Close current buffer\n");
+    fprintf(help_file, "\n");
+    fprintf(help_file, "=== FILE OPERATIONS ===\n");
+    fprintf(help_file, ":w              | Write current buffer to file\n");
+    fprintf(help_file, ":w <path>       | Write to specific path\n");
+    fprintf(help_file, ":q              | Quit current buffer (warns if dirty)\n");
+    fprintf(help_file, ":q!             | Force quit current buffer\n");
+    fprintf(help_file, ":qa             | Quit all buffers (warns if dirty)\n");
+    fprintf(help_file, ":qa!            | Force quit all buffers\n");
+    fprintf(help_file, "\n");
+    fprintf(help_file, "=== SETTINGS ===\n");
+    fprintf(help_file, "L               | Toggle line numbers\n");
+    fprintf(help_file, "T               | Toggle line wrapping\n");
+    fprintf(help_file, "\n");
+    fprintf(help_file, "=== OTHER ===\n");
+    fprintf(help_file, ":p              | Paste from clipboard\n");
+    fprintf(help_file, ":<num>          | Jump to line number\n");
+    fprintf(help_file, ":?              | Show this help\n");
+    fprintf(help_file, "q               | Quit (in normal mode)\n");
+
+    fflush(help_file);
+    fclose(help_file);
+
+    char cmd[8192];
+    if (have_nfzf) {
+        snprintf(cmd, sizeof(cmd),
+                 "nfzf < \"%s\" > /dev/null 2>/dev/null",
+                 help_template);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "fzf --height=100%% --layout=reverse --border "
+                 "--header='Help - Search commands (ESC to close)' "
+                 "< \"%s\" > /dev/null 2> /dev/tty",
+                 help_template);
+    }
+
+    def_prog_mode();
+    endwin();
+    system(cmd);
+    reset_prog_mode();
+    refresh();
+
+    unlink(help_template);
 }
 
 static void handle_command_key(ViewerState *st, int ch, int *running) {
@@ -1832,6 +2023,48 @@ static void handle_input(ViewerState *st, int *running) {
 
     Buffer *b = &st->buffers[st->current_buffer];
 
+    // Handle Visual mode
+    if (st->mode == MODE_VISUAL) {
+        if (ch == 27) {
+            st->mode = MODE_NORMAL;
+            st->op_pending = OP_NONE;
+            return;
+        }
+        if (ch == 'y') {
+            visual_copy_to_clipboard(st);
+            st->mode = MODE_NORMAL;
+            st->op_pending = OP_NONE;
+            return;
+        }
+        // Handle movement in visual mode to update selection
+        if (ch == 'j' || ch == KEY_DOWN) {
+            move_down(st);
+            st->vis_end = st->cursor_line;
+            ensure_cursor_visible(st);
+            return;
+        }
+        if (ch == 'k' || ch == KEY_UP) {
+            move_up(st);
+            st->vis_end = st->cursor_line;
+            ensure_cursor_visible(st);
+            return;
+        }
+        if (ch == 'g') {
+            st->cursor_line = 0;
+            st->cursor_col = 0;
+            st->vis_end = st->cursor_line;
+            ensure_cursor_visible(st);
+            return;
+        }
+        if (ch == 'G') {
+            st->cursor_line = b->line_count - 1;
+            st->cursor_col = 0;
+            st->vis_end = st->cursor_line;
+            ensure_cursor_visible(st);
+            return;
+        }
+    }
+
     if (st->g_pending) {
         st->g_pending = 0;
         if (ch == 'g') { st->cursor_line = 0; st->cursor_col = 0; ensure_cursor_visible(st); return; }
@@ -1841,6 +2074,41 @@ static void handle_input(ViewerState *st, int *running) {
 
     if (st->op_pending != OP_NONE) {
         if (ch == 27) { st->op_pending = OP_NONE; return; }
+        
+        // Handle yy (yank line)
+        if (ch == 'y' && st->op_pending == OP_YANK) {
+            clipboard_copy_text(b->lines[st->cursor_line]);
+            set_status(st, "Yanked line");
+            st->op_pending = OP_NONE;
+            return;
+        }
+        
+        // Handle dd (delete line)
+        if (ch == 'd' && st->op_pending == OP_DELETE) {
+            clipboard_copy_text(b->lines[st->cursor_line]);
+            undo_push(b);
+            free(b->lines[st->cursor_line]);
+            for (int i = st->cursor_line; i < b->line_count - 1; i++) {
+                b->lines[i] = b->lines[i + 1];
+            }
+            b->lines[b->line_count - 1] = NULL;
+            b->line_count--;
+            if (b->line_count <= 0) {
+                b->line_count = 1;
+                b->lines[0] = strdup("");
+                st->cursor_line = 0;
+            }
+            if (st->cursor_line >= b->line_count) {
+                st->cursor_line = b->line_count - 1;
+            }
+            st->cursor_col = 0;
+            b->dirty = 1;
+            set_status(st, "Deleted line");
+            st->op_pending = OP_NONE;
+            ensure_cursor_visible(st);
+            return;
+        }
+        
         if (ch == '%') {
             int toL,toC,fromL,fromC;
             if (jump_percent(st, &toL,&toC,&fromL,&fromC)) {
@@ -1866,6 +2134,11 @@ static void handle_input(ViewerState *st, int *running) {
         case 27: clear_search(st); st->op_pending = OP_NONE; set_status(st, "noh"); return;
         case 'x': close_current_buffer(st); return;
         case 'i': st->mode = MODE_INSERT; return;
+        case 'V':
+            st->mode = MODE_VISUAL;
+            st->vis_start = st->cursor_line;
+            st->vis_end = st->cursor_line;
+            return;
         case '/': prompt_search(st); ensure_cursor_visible(st); return;
         case 'n': next_match(st); ensure_cursor_visible(st); return;
         case 'N': prev_match(st); ensure_cursor_visible(st); return;
