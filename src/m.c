@@ -11,6 +11,7 @@
 #include <termios.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <stdbool.h>
 
 #define MAX_BUFFERS   20
 #define MAX_LINES     100000
@@ -174,7 +175,12 @@ static void manual_buffer_list_fallback(ViewerState *st) {
     reset_prog_mode();
     refresh();
 }
-
+static void get_cwd(char *out, size_t out_len) {
+    if (!out || out_len == 0) return;
+    if (!getcwd(out, out_len)) {
+        snprintf(out, out_len, ".");
+    }
+}
 static void strip_ansi(char *s) {
     char *d = s;
     for (char *p = s; *p; ) {
@@ -1168,6 +1174,7 @@ static int in_tmux(void) {
     return (t && *t);
 }
 
+
 static int tmux_pane_alive(const char *pane_id) {
     if (!pane_id || !*pane_id) return 0;
 
@@ -1175,29 +1182,53 @@ static int tmux_pane_alive(const char *pane_id) {
     shell_quote_single(qid, sizeof(qid), pane_id);
 
     char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "tmux display-message -p -t %s '#{pane_id}' 2>/dev/null", qid);
-
-    FILE *p = popen(cmd, "r");
-    if (!p) return 0;
-
-    char buf[128] = {0};
-    int alive = (fgets(buf, sizeof(buf), p) != NULL);
-    pclose(p);
-    return alive;
+    // exits nonzero if pane doesn't exist
+    snprintf(cmd, sizeof(cmd), "tmux list-panes -F '#{pane_id}' | grep -qx %s", qid);
+    return system(cmd) == 0;
 }
 
-static void tmux_kill_pane(const char *pane_id) {
-    if (!pane_id || !*pane_id) return;
+static int tmux_kill_pane(const char *pane_id) {
+    if (!pane_id || !*pane_id) return -1;
 
     char qid[256];
     shell_quote_single(qid, sizeof(qid), pane_id);
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "tmux kill-pane -t %s 2>/dev/null", qid);
-    system(cmd);
+    return system(cmd);
 }
 
+// Returns 0 on success, -1 on failure
+static int tmux_create_bottom_terminal(const char *cwd, char *out_pane, size_t out_len) {
+    if (!cwd || !*cwd || !out_pane || out_len == 0) return -1;
+
+    char qcwd[2048];
+    shell_quote_single(qcwd, sizeof(qcwd), cwd);
+
+    // -P prints info about the new pane, -F chooses the format -> just the pane id
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "tmux split-window -v -p 30 -c %s -P -F '#{pane_id}'", qcwd);
+
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+
+    char buf[128] = {0};
+    if (!fgets(buf, sizeof(buf), p)) {
+        pclose(p);
+        return -1;
+    }
+    pclose(p);
+
+    buf[strcspn(buf, "\r\n")] = '\0';
+    if (!buf[0]) return -1;
+
+    strncpy(out_pane, buf, out_len - 1);
+    out_pane[out_len - 1] = '\0';
+
+    // go back to the editor/file pane
+    system("tmux last-pane 2>/dev/null");
+    return 0;
+}
 static void buffer_cwd(const Buffer *b, char *out, size_t out_len) {
     if (!out || out_len == 0) return;
     out[0] = '\0';
@@ -1217,73 +1248,172 @@ static void buffer_cwd(const Buffer *b, char *out, size_t out_len) {
     // Fallback: process cwd.
     if (getcwd(out, out_len) == NULL) snprintf(out, out_len, ".");
 }
+static char g_terminal_pane_id[128] = {0};
 
-static int tmux_toggle_terminal_vic(ViewerState *st) {
-    if (!st) return -1;
 
-    if (!in_tmux()) {
-        set_status(st, "terminal toggle: not in tmux");
-        return 0;
-    }
+static void chomp(char *s) {
+    if (!s) return;
+    size_t n = strlen(s);
+    while (n && (s[n-1] == '\n' || s[n-1] == '\r')) s[--n] = '\0';
+}
+static void sh_quote(const char *in, char *out, size_t out_sz) {
+    // output: '...'
+    // replaces ' with '"'"'
+    size_t j = 0;
+    if (out_sz < 3) { if (out_sz) out[0] = 0; return; }
 
-    // If we have a remembered pane id and it's alive -> kill it (toggle off)
-    if (st->terminal_pane_id[0]) {
-        if (tmux_pane_alive(st->terminal_pane_id)) {
-            tmux_kill_pane(st->terminal_pane_id);
-            st->terminal_pane_id[0] = '\0';
-            set_status(st, "terminal: closed");
-            return 0;
+    out[j++] = '\'';
+    for (size_t i = 0; in && in[i]; i++) {
+        if (j + 6 >= out_sz) break;
+        if (in[i] == '\'') {
+            // close ', insert '"'"', reopen '
+            out[j++] = '\'';
+            out[j++] = '"';
+            out[j++] = '\'';
+            out[j++] = '"';
+            out[j++] = '\'';
+        } else {
+            out[j++] = in[i];
         }
-        // stale id
-        st->terminal_pane_id[0] = '\0';
     }
-
-    // Toggle on: split a new pane at bottom in the buffer’s directory.
-    Buffer *b = &st->buffers[st->current_buffer];
-    char cwd[1024];
-    buffer_cwd(b, cwd, sizeof(cwd));
-
-    char qcwd[2048];
-    shell_quote_single(qcwd, sizeof(qcwd), cwd);
-
-    // Create bottom split, then print the new pane id so we can store it.
-    // -P prints format, -F sets it, so stdout gives us the pane_id.
-    char cmd[4096];
+    out[j++] = '\'';
+    out[j] = '\0';
+}
+static int tmux_pane_exists_simple(const char *pane_id) {
+    if (!pane_id || !*pane_id) return 0;
+    char cmd[256];
+    // exact match in current server
     snprintf(cmd, sizeof(cmd),
-             "tmux split-window -v -p 30 -c %s -P -F '#{pane_id}' 2>/dev/null",
-             qcwd);
+             "tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx '%s'",
+             pane_id);
+    return system(cmd) == 0;
+}
 
-    FILE *p = popen(cmd, "r");
-    if (!p) {
-        set_status(st, "terminal: failed to split");
-        return -1;
-    }
+static int tmux_get_window_opt(const char *opt, char *out, size_t out_len) {
+    if (!opt || !out || out_len == 0) return -1;
+    out[0] = '\0';
 
-    char pane[128] = {0};
-    if (!fgets(pane, sizeof(pane), p)) {
-        pclose(p);
-        set_status(st, "terminal: failed to read pane id");
-        return -1;
-    }
-    pclose(p);            // keep only this one if you remove the line above
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "tmux show-options -w -qv %s 2>/dev/null", opt);
 
-    // Trim newline(s)
-    pane[strcspn(pane, "\r\n")] = '\0';
-    if (!pane[0]) {
-        set_status(st, "terminal: no pane id");
-        return -1;
-    }
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return -1;
 
-    strncpy(st->terminal_pane_id, pane, sizeof(st->terminal_pane_id) - 1);
-    st->terminal_pane_id[sizeof(st->terminal_pane_id) - 1] = '\0';
+    if (fgets(out, (int)out_len, fp)) chomp(out);
+    pclose(fp);
 
-    // Return focus to the editor pane
-    system("tmux last-pane 2>/dev/null");
-
-    set_status(st, "terminal: opened");
     return 0;
 }
-// Unified picker: nfzf -> fzf -> manual prompt. Returns malloc'd string or NULL.
+
+static void tmux_set_window_opt(const char *opt, const char *val) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "tmux set-option -w %s '%s' 2>/dev/null", opt, val ? val : "");
+    system(cmd);
+}
+
+static void tmux_unset_window_opt(const char *opt) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "tmux unset-option -w %s 2>/dev/null", opt);
+    system(cmd);
+}
+
+void tmux_toggle_terminal(const char *cwd) {
+    if (!getenv("TMUX")) return;
+
+    char pane[64] = {0};
+    tmux_get_window_opt("@vic_term_pane", pane, sizeof(pane));
+
+    // TOGGLE OFF
+    if (pane[0] && tmux_pane_exists_simple(pane)) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "tmux kill-pane -t '%s' 2>/dev/null", pane);
+        system(cmd);
+        tmux_unset_window_opt("@vic_term_pane");
+        return;
+    }
+
+    // stale option (pane died)
+    if (pane[0] && !tmux_pane_exists_simple(pane)) {
+        tmux_unset_window_opt("@vic_term_pane");
+        pane[0] = '\0';
+    }
+
+    // TOGGLE ON
+    char qcwd[2048];
+    sh_quote((cwd && *cwd) ? cwd : ".", qcwd, sizeof(qcwd));
+
+    // create the pane (it becomes active)
+    {
+        char cmd[4096];
+        snprintf(cmd, sizeof(cmd), "tmux split-window -v -l 35%% -c %s 2>/dev/null", qcwd);
+        system(cmd);
+    }
+
+    // read the active pane id (that’s the new one), then go back
+    {
+        FILE *fp = popen("tmux display-message -p '#{pane_id}' 2>/dev/null", "r");
+        if (!fp) return;
+
+        char newpane[64] = {0};
+        if (fgets(newpane, sizeof(newpane), fp)) {
+            chomp(newpane);
+            if (newpane[0]) tmux_set_window_opt("@vic_term_pane", newpane);
+        }
+        pclose(fp);
+
+        system("tmux last-pane 2>/dev/null");
+    }
+}
+// very small shell quote helper for paths
+
+static int tmux_run_capture(const char *cmd, char *out, size_t outlen) {
+    if (!out || outlen == 0) return -1;
+    out[0] = '\0';
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return -1;
+
+    if (!fgets(out, (int)outlen, fp)) {
+        pclose(fp);
+        return -1;
+    }
+    pclose(fp);
+
+    // trim \r\n
+    out[strcspn(out, "\r\n")] = '\0';
+    return out[0] ? 0 : -1;
+}
+
+static int tmux_pane_exists_grep(const char *pane_id) {
+    if (!pane_id || !*pane_id) return 0;
+
+    char qid[256];
+    shell_quote_single(qid, sizeof(qid), pane_id);
+
+    char cmd[512];
+    // -a = all sessions, safe; -F = only pane_id; grep exact whole-line match
+    snprintf(cmd, sizeof(cmd),
+             "tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fxq -- %s",
+             qid);
+    return system(cmd) == 0;
+}
+static int tmux_capture_first_line(const char *cmd, char *out, size_t outlen) {
+    if (!out || outlen == 0) return -1;
+    out[0] = '\0';
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return -1;
+
+    if (!fgets(out, (int)outlen, fp)) {
+        pclose(fp);
+        return -1;
+    }
+    pclose(fp);
+
+    out[strcspn(out, "\r\n")] = '\0';
+    return out[0] ? 0 : -1;
+}
+
 static char *pick_file(void) {
     int have_nfzf = check_command_exists("nfzf");
     int have_fzf  = check_command_exists("fzf");
@@ -2245,7 +2375,7 @@ static void handle_input(ViewerState *st, int *running) {
             ensure_cursor_visible(st);
             return;
         }
-          
+
         if (ch == '%') {
             int toL,toC,fromL,fromC;
             if (jump_percent(st, &toL,&toC,&fromL,&fromC)) {
@@ -2281,9 +2411,14 @@ static void handle_input(ViewerState *st, int *running) {
         case 'N': prev_match(st); ensure_cursor_visible(st); return;
         case 'u': do_undo(st); ensure_cursor_visible(st); return;
         case 't': {
+ char cwd[1024];
+    get_cwd(cwd, sizeof(cwd));
+
     def_prog_mode();
     endwin();
-    tmux_toggle_terminal_vic(st);
+
+    tmux_toggle_terminal(cwd);
+
     reset_prog_mode();
     refresh();
     return;
