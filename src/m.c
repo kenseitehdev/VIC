@@ -1345,7 +1345,7 @@ void tmux_toggle_terminal(const char *cwd) {
     // create the pane (it becomes active)
     {
         char cmd[4096];
-        snprintf(cmd, sizeof(cmd), "tmux split-window -v -l 35%% -c %s 2>/dev/null", qcwd);
+        snprintf(cmd, sizeof(cmd), "tmux split-window -v -l 30%% -c %s 2>/dev/null", qcwd);
         system(cmd);
     }
 
