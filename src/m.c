@@ -86,6 +86,7 @@ typedef struct {
     int op_start_line;
     int op_start_col;
     int free_scroll;
+    char terminal_pane_id[128];
 } ViewerState;
 
 #define COLOR_NORMAL       1
@@ -1145,7 +1146,143 @@ static int add_buffer_from_path(ViewerState *st, const char *path) {
     set_status(st, "Added buffer");
     return 0;
 }
+static void shell_quote_single(char *out, size_t out_len, const char *in) {
+    size_t j = 0;
+    if (!out || out_len == 0) return;
 
+    out[j++] = '\'';
+    for (size_t i = 0; in && in[i] != '\0' && j + 6 < out_len; i++) {
+        if (in[i] == '\'') {
+            const char *esc = "'\"'\"'";
+            for (int k = 0; esc[k] && j + 1 < out_len; k++) out[j++] = esc[k];
+        } else {
+            out[j++] = in[i];
+        }
+    }
+    if (j + 1 < out_len) out[j++] = '\'';
+    out[j] = '\0';
+}
+
+static int in_tmux(void) {
+    const char *t = getenv("TMUX");
+    return (t && *t);
+}
+
+static int tmux_pane_alive(const char *pane_id) {
+    if (!pane_id || !*pane_id) return 0;
+
+    char qid[256];
+    shell_quote_single(qid, sizeof(qid), pane_id);
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "tmux display-message -p -t %s '#{pane_id}' 2>/dev/null", qid);
+
+    FILE *p = popen(cmd, "r");
+    if (!p) return 0;
+
+    char buf[128] = {0};
+    int alive = (fgets(buf, sizeof(buf), p) != NULL);
+    pclose(p);
+    return alive;
+}
+
+static void tmux_kill_pane(const char *pane_id) {
+    if (!pane_id || !*pane_id) return;
+
+    char qid[256];
+    shell_quote_single(qid, sizeof(qid), pane_id);
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "tmux kill-pane -t %s 2>/dev/null", qid);
+    system(cmd);
+}
+
+static void buffer_cwd(const Buffer *b, char *out, size_t out_len) {
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+
+    // Prefer the directory of the current file if it has a slash.
+    if (b && b->filepath[0] && strcmp(b->filepath, "<stdin>") != 0) {
+        const char *slash = strrchr(b->filepath, '/');
+        if (slash && slash != b->filepath) {
+            size_t n = (size_t)(slash - b->filepath);
+            if (n >= out_len) n = out_len - 1;
+            memcpy(out, b->filepath, n);
+            out[n] = '\0';
+            return;
+        }
+    }
+
+    // Fallback: process cwd.
+    if (getcwd(out, out_len) == NULL) snprintf(out, out_len, ".");
+}
+
+static int tmux_toggle_terminal_vic(ViewerState *st) {
+    if (!st) return -1;
+
+    if (!in_tmux()) {
+        set_status(st, "terminal toggle: not in tmux");
+        return 0;
+    }
+
+    // If we have a remembered pane id and it's alive -> kill it (toggle off)
+    if (st->terminal_pane_id[0]) {
+        if (tmux_pane_alive(st->terminal_pane_id)) {
+            tmux_kill_pane(st->terminal_pane_id);
+            st->terminal_pane_id[0] = '\0';
+            set_status(st, "terminal: closed");
+            return 0;
+        }
+        // stale id
+        st->terminal_pane_id[0] = '\0';
+    }
+
+    // Toggle on: split a new pane at bottom in the buffer’s directory.
+    Buffer *b = &st->buffers[st->current_buffer];
+    char cwd[1024];
+    buffer_cwd(b, cwd, sizeof(cwd));
+
+    char qcwd[2048];
+    shell_quote_single(qcwd, sizeof(qcwd), cwd);
+
+    // Create bottom split, then print the new pane id so we can store it.
+    // -P prints format, -F sets it, so stdout gives us the pane_id.
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+             "tmux split-window -v -p 30 -c %s -P -F '#{pane_id}' 2>/dev/null",
+             qcwd);
+
+    FILE *p = popen(cmd, "r");
+    if (!p) {
+        set_status(st, "terminal: failed to split");
+        return -1;
+    }
+
+    char pane[128] = {0};
+    if (!fgets(pane, sizeof(pane), p)) {
+        pclose(p);
+        set_status(st, "terminal: failed to read pane id");
+        return -1;
+    }
+    pclose(p);            // keep only this one if you remove the line above
+
+    // Trim newline(s)
+    pane[strcspn(pane, "\r\n")] = '\0';
+    if (!pane[0]) {
+        set_status(st, "terminal: no pane id");
+        return -1;
+    }
+
+    strncpy(st->terminal_pane_id, pane, sizeof(st->terminal_pane_id) - 1);
+    st->terminal_pane_id[sizeof(st->terminal_pane_id) - 1] = '\0';
+
+    // Return focus to the editor pane
+    system("tmux last-pane 2>/dev/null");
+
+    set_status(st, "terminal: opened");
+    return 0;
+}
 // Unified picker: nfzf -> fzf -> manual prompt. Returns malloc'd string or NULL.
 static char *pick_file(void) {
     int have_nfzf = check_command_exists("nfzf");
@@ -1801,7 +1938,7 @@ static void exit_command_mode(ViewerState *st) {
 static void cmd_show_help(ViewerState *st) {
     int have_nfzf = check_command_exists("nfzf");
     int have_fzf = check_command_exists("fzf");
-    
+
     if (!have_nfzf && !have_fzf) {
         set_status(st, "fzf or nfzf required for help menu");
         return;
@@ -2074,7 +2211,7 @@ static void handle_input(ViewerState *st, int *running) {
 
     if (st->op_pending != OP_NONE) {
         if (ch == 27) { st->op_pending = OP_NONE; return; }
-        
+
         // Handle yy (yank line)
         if (ch == 'y' && st->op_pending == OP_YANK) {
             clipboard_copy_text(b->lines[st->cursor_line]);
@@ -2082,7 +2219,7 @@ static void handle_input(ViewerState *st, int *running) {
             st->op_pending = OP_NONE;
             return;
         }
-        
+
         // Handle dd (delete line)
         if (ch == 'd' && st->op_pending == OP_DELETE) {
             clipboard_copy_text(b->lines[st->cursor_line]);
@@ -2108,7 +2245,7 @@ static void handle_input(ViewerState *st, int *running) {
             ensure_cursor_visible(st);
             return;
         }
-        
+          
         if (ch == '%') {
             int toL,toC,fromL,fromC;
             if (jump_percent(st, &toL,&toC,&fromL,&fromC)) {
@@ -2143,6 +2280,14 @@ static void handle_input(ViewerState *st, int *running) {
         case 'n': next_match(st); ensure_cursor_visible(st); return;
         case 'N': prev_match(st); ensure_cursor_visible(st); return;
         case 'u': do_undo(st); ensure_cursor_visible(st); return;
+        case 't': {
+    def_prog_mode();
+    endwin();
+    tmux_toggle_terminal_vic(st);
+    reset_prog_mode();
+    refresh();
+    return;
+}
         case 18:  do_redo(st); ensure_cursor_visible(st); return; // Ctrl+R
         case 'p': {
             char *clip = clipboard_paste_text();
