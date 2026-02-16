@@ -1415,7 +1415,7 @@ static int tmux_capture_first_line(const char *cmd, char *out, size_t outlen) {
 }
 
 static char *pick_file(void) {
-    int have_nfzf = check_command_exists("nfzf");
+    int have_nfzf = check_command_exists("ff");
     int have_fzf  = check_command_exists("fzf");
 
     if (!have_nfzf && !have_fzf) {
@@ -1454,7 +1454,7 @@ static char *pick_file(void) {
             snprintf(cmd, sizeof(cmd),
                 "fd -L -t f . "
                 "--exclude .git --exclude node_modules --exclude build --exclude dist --exclude .cache "
-                "2>/dev/null | nfzf > \"%s\" 2>/dev/null",
+                "2>/dev/null | ff > \"%s\" 2>/dev/null",
                 tmp_template
             );
         } else {
@@ -1473,7 +1473,7 @@ static char *pick_file(void) {
 
         if (have_nfzf) {
             snprintf(cmd, sizeof(cmd),
-                "%s | nfzf > \"%s\" 2>/dev/null",
+                "%s | ff > \"%s\" 2>/dev/null",
                 find_cmd, tmp_template
             );
         } else {
@@ -1526,7 +1526,7 @@ static void add_buffer_from_file(ViewerState *st, const char *path) {
 static void cmd_list_buffers(ViewerState *st) {
     if (!st) return;
 
-    int have_nfzf = check_command_exists("nfzf");
+    int have_nfzf = check_command_exists("ff");
     int have_fzf  = check_command_exists("fzf");
 
     if (!have_nfzf && !have_fzf) {
@@ -1570,7 +1570,7 @@ static void cmd_list_buffers(ViewerState *st) {
     char cmd[8192];
     if (have_nfzf) {
         snprintf(cmd, sizeof(cmd),
-                 "nfzf < \"%s\" > \"%s\" 2> /dev/null",
+                 "ff < \"%s\" > \"%s\" 2> /dev/null",
                  list_template, result_template);
     } else {
         snprintf(cmd, sizeof(cmd),
@@ -2066,11 +2066,11 @@ static void exit_command_mode(ViewerState *st) {
 }
 
 static void cmd_show_help(ViewerState *st) {
-    int have_nfzf = check_command_exists("nfzf");
+    int have_nfzf = check_command_exists("ff");
     int have_fzf = check_command_exists("fzf");
 
     if (!have_nfzf && !have_fzf) {
-        set_status(st, "fzf or nfzf required for help menu");
+        set_status(st, "fzf or ff required for help menu");
         return;
     }
 
@@ -2159,7 +2159,7 @@ static void cmd_show_help(ViewerState *st) {
     char cmd[8192];
     if (have_nfzf) {
         snprintf(cmd, sizeof(cmd),
-                 "nfzf < \"%s\" > /dev/null 2>/dev/null",
+                 "ff < \"%s\" > /dev/null 2>/dev/null",
                  help_template);
     } else {
         snprintf(cmd, sizeof(cmd),
