@@ -1316,7 +1316,53 @@ static void tmux_unset_window_opt(const char *opt) {
     snprintf(cmd, sizeof(cmd), "tmux unset-option -w %s 2>/dev/null", opt);
     system(cmd);
 }
+void tmux_toggle_lldb(const char *cwd) {
+    if (!getenv("TMUX")) return;
 
+    char pane[64] = {0};
+    tmux_get_window_opt("@vic_lldb_pane", pane, sizeof(pane));
+
+    // TOGGLE OFF
+    if (pane[0] && tmux_pane_exists_simple(pane)) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "tmux kill-pane -t '%s' 2>/dev/null", pane);
+        system(cmd);
+        tmux_unset_window_opt("@vic_lldb_pane");
+        return;
+    }
+
+    // stale option (pane died)
+    if (pane[0] && !tmux_pane_exists_simple(pane)) {
+        tmux_unset_window_opt("@vic_lldb_pane");
+        pane[0] = '\0';
+    }
+
+    // TOGGLE ON
+    char qcwd[2048];
+    sh_quote((cwd && *cwd) ? cwd : ".", qcwd, sizeof(qcwd));
+
+    // create the pane (it becomes active)
+    {
+        char cmd[4096];
+snprintf(cmd, sizeof(cmd), "tmux split-window -h -p 20 -c %s 2>/dev/null", qcwd);
+        system(cmd);
+    }
+
+    // read the active pane id (that’s the new one), then go back
+    {
+        FILE *fp = popen("tmux display-message -p '#{pane_id}' 2>/dev/null", "r");
+        if (!fp) return;
+
+        char newpane[64] = {0};
+        if (fgets(newpane, sizeof(newpane), fp)) {
+            chomp(newpane);
+            if (newpane[0]) tmux_set_window_opt("@vic_lldb_pane", newpane);
+        }
+        pclose(fp);
+
+        system("tmux last-pane 2>/dev/null");
+    }
+}
 void tmux_toggle_terminal(const char *cwd) {
     if (!getenv("TMUX")) return;
 
@@ -2418,6 +2464,19 @@ static void handle_input(ViewerState *st, int *running) {
     endwin();
 
     tmux_toggle_terminal(cwd);
+
+    reset_prog_mode();
+    refresh();
+    return;
+}
+        case '!': {
+ char cwd[1024];
+    get_cwd(cwd, sizeof(cwd));
+
+    def_prog_mode();
+    endwin();
+
+    tmux_toggle_lldb(cwd);
 
     reset_prog_mode();
     refresh();
