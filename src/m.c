@@ -22,9 +22,9 @@
 #define MAX_LINES     100000
 #define MAX_LINE_LEN  2048
 
-#define UNDO_MAX      5
-#define REDO_MAX      5
-#define CMDHIST_MAX   5
+#define UNDO_MAX      25
+#define REDO_MAX      25
+#define CMDHIST_MAX   25
 
 typedef enum {
     LANG_NONE = 0,
