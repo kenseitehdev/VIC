@@ -1,7 +1,4 @@
 // vic
-// =============================
-// vic: types / config
-// =============================
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -19,7 +16,9 @@
 #include <stdbool.h>
 
 #define MAX_BUFFERS   20
-#define MAX_LINES     100000
+// [CHANGE 1] MAX_LINES now controls the initial capacity of the dynamic line
+// pointer array.  The array grows as needed; see buf_ensure_capacity().
+#define INITIAL_LINE_CAP 1024
 #define MAX_LINE_LEN  2048
 
 #define UNDO_MAX      25
@@ -40,8 +39,12 @@ typedef struct {
 } WrappedLine;
 
 typedef struct {
-    char *lines[MAX_LINES];
+    // [CHANGE 1] lines is now a dynamically-sized heap array; line_cap tracks
+    // the allocated capacity so we can realloc when needed.
+    char **lines;
     int line_count;
+    int line_cap;           // allocated slots in lines[]
+
     char filepath[1024];    // empty => [No Name]
     Language lang;
     int scroll_offset;      // top logical line
@@ -111,6 +114,10 @@ typedef struct {
 
     // --- needed by your insert-mode undo coalescing ---
     int insert_undo_armed;
+
+    // [CHANGE 4/5] track whether a '%' was typed as a count prefix in normal
+    // mode (i.e. :%y / :%d meaning "all lines").
+    int percent_pending;
 } ViewerState;
 
 #define COLOR_NORMAL       1
@@ -431,9 +438,25 @@ static void highlight_line(const char *line, Language lang, int y, int start_x, 
     }
 }
 
+// [CHANGE 1] Ensure the line pointer array has room for at least `needed`
+// entries, growing by doubling if necessary.
+static int buf_ensure_capacity(Buffer *b, int needed) {
+    if (needed <= b->line_cap) return 1;
+    int new_cap = b->line_cap ? b->line_cap : INITIAL_LINE_CAP;
+    while (new_cap < needed) new_cap *= 2;
+    char **np = (char**)realloc(b->lines, (size_t)new_cap * sizeof(char*));
+    if (!np) return 0;
+    b->lines = np;
+    b->line_cap = new_cap;
+    return 1;
+}
+
 static void buffer_init_blank(Buffer *b, const char *filepath) {
     memset(b, 0, sizeof(*b));
     b->is_active = 1;
+    // [CHANGE 1] allocate initial dynamic array
+    b->line_cap = INITIAL_LINE_CAP;
+    b->lines = (char**)calloc((size_t)b->line_cap, sizeof(char*));
     if (filepath && *filepath) {
         snprintf(b->filepath, sizeof(b->filepath), "%s", filepath);
         b->lang = detect_language(filepath);
@@ -455,7 +478,10 @@ static void free_buffer(Buffer *b) {
         free(b->lines[i]);
         b->lines[i] = NULL;
     }
+    free(b->lines);          // [CHANGE 1] free the dynamic array itself
+    b->lines = NULL;
     b->line_count = 0;
+    b->line_cap = 0;
     b->is_active = 0;
     for (int i = 0; i < b->undo_len; i++) free(b->undo[i]);
     for (int i = 0; i < b->redo_len; i++) free(b->redo[i]);
@@ -476,12 +502,17 @@ static int load_file(Buffer *b, const char *filepath) {
     memset(b, 0, sizeof(*b));
     b->is_active = 1;
     b->scroll_offset = 0;
+    // [CHANGE 1] start with initial capacity; grows as needed
+    b->line_cap = INITIAL_LINE_CAP;
+    b->lines = (char**)calloc((size_t)b->line_cap, sizeof(char*));
     snprintf(b->filepath, sizeof(b->filepath), "%s", filepath);
     b->lang = detect_language(filepath);
     b->dirty = 0;
 
     char line[MAX_LINE_LEN];
-    while (fgets(line, sizeof(line), f) && b->line_count < MAX_LINES) {
+    while (fgets(line, sizeof(line), f)) {
+        // [CHANGE 1] grow the array instead of silently stopping
+        if (!buf_ensure_capacity(b, b->line_count + 1)) break;
         line[strcspn(line, "\n")] = 0;
         strip_overstrikes(line);
         strip_ansi(line);
@@ -503,13 +534,17 @@ static int load_file(Buffer *b, const char *filepath) {
 static int load_stdin(Buffer *b) {
     memset(b, 0, sizeof(*b));
     b->is_active = 1;
+    // [CHANGE 1] dynamic array
+    b->line_cap = INITIAL_LINE_CAP;
+    b->lines = (char**)calloc((size_t)b->line_cap, sizeof(char*));
     snprintf(b->filepath, sizeof(b->filepath), "%s", "<stdin>");
     b->lang = LANG_NONE;
     b->scroll_offset = 0;
     b->dirty = 0;
 
     char line[MAX_LINE_LEN];
-    while (fgets(line, sizeof(line), stdin) && b->line_count < MAX_LINES) {
+    while (fgets(line, sizeof(line), stdin)) {
+        if (!buf_ensure_capacity(b, b->line_count + 1)) break;
         size_t len = strlen(line);
         while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
         strip_overstrikes(line);
@@ -544,15 +579,17 @@ static void buffer_deserialize(Buffer *b, const char *text) {
     b->line_count = 0;
 
     if (!text) {
+        if (!buf_ensure_capacity(b, 1)) return;
         b->line_count = 1;
         b->lines[0] = strdup("");
         return;
     }
 
     const char *p = text;
-    while (*p && b->line_count < MAX_LINES) {
+    while (*p) {
         const char *nl = strchr(p, '\n');
         size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (!buf_ensure_capacity(b, b->line_count + 1)) break;
         char *line = (char*)malloc(len + 1);
         memcpy(line, p, len);
         line[len] = '\0';
@@ -562,8 +599,10 @@ static void buffer_deserialize(Buffer *b, const char *text) {
     }
 
     if (b->line_count == 0) {
-        b->line_count = 1;
-        b->lines[0] = strdup("");
+        if (buf_ensure_capacity(b, 1)) {
+            b->line_count = 1;
+            b->lines[0] = strdup("");
+        }
     }
 }
 
@@ -992,7 +1031,9 @@ static void insert_newline(Buffer *b, int *line_io, int *col_io) {
     int line = *line_io;
     int col = *col_io;
     if (line < 0 || line >= b->line_count) return;
-    if (b->line_count >= MAX_LINES) return;
+
+    // [CHANGE 1] grow dynamically instead of hard limit
+    if (!buf_ensure_capacity(b, b->line_count + 1)) return;
 
     char *s = b->lines[line];
     int len = (int)strlen(s);
@@ -1029,9 +1070,6 @@ static void paste_text_at_cursor(ViewerState *st, const char *text) {
     }
 }
 
-// NOTE: your original delete_range_to_match is huge; kept as-is in your file.
-// For brevity of the "fixed file", I’m leaving it unchanged.
-// Paste your existing delete_range_to_match() right here.
 static void delete_range_to_match(ViewerState *st, int aL, int aC, int bL, int bC, int also_yank) {
     Buffer *b = &st->buffers[st->current_buffer];
     int sL=aL, sC=aC, eL=bL, eC=bC;
@@ -1120,6 +1158,84 @@ static void delete_range_to_match(ViewerState *st, int aL, int aC, int bL, int b
     st->cursor_col = sC;
     ensure_cursor_bounds(st);
     free(tmp);
+}
+
+// [CHANGE 2/3] Delete visual selection lines (lo..hi inclusive).
+// Returns a malloc'd string with the deleted content (caller frees).
+static char *delete_visual_lines(ViewerState *st) {
+    Buffer *b = &st->buffers[st->current_buffer];
+    int lo = st->vis_start < st->vis_end ? st->vis_start : st->vis_end;
+    int hi = st->vis_start > st->vis_end ? st->vis_start : st->vis_end;
+
+    if (lo < 0) lo = 0;
+    if (hi >= b->line_count) hi = b->line_count - 1;
+
+    // Build yanked text
+    size_t total = 0;
+    for (int i = lo; i <= hi; i++) total += strlen(b->lines[i]) + 1;
+    char *out = (char*)malloc(total + 1);
+    if (!out) return NULL;
+    out[0] = '\0';
+    for (int i = lo; i <= hi; i++) {
+        strcat(out, b->lines[i]);
+        if (i != hi) strcat(out, "\n");
+    }
+
+    // Push undo before mutating
+    undo_push(b);
+
+    // Free deleted lines
+    for (int i = lo; i <= hi; i++) {
+        free(b->lines[i]);
+        b->lines[i] = NULL;
+    }
+
+    // Compact the array
+    int deleted = hi - lo + 1;
+    for (int i = lo; i < b->line_count - deleted; i++)
+        b->lines[i] = b->lines[i + deleted];
+    for (int i = b->line_count - deleted; i < b->line_count; i++)
+        b->lines[i] = NULL;
+    b->line_count -= deleted;
+
+    // Always keep at least one line
+    if (b->line_count == 0) {
+        b->line_count = 1;
+        b->lines[0] = strdup("");
+    }
+
+    b->dirty = 1;
+
+    // Place cursor at first deleted line (clamped)
+    st->cursor_line = lo;
+    st->cursor_col  = 0;
+    ensure_cursor_bounds(st);
+
+    return out;
+}
+
+// [CHANGE 4/5] Yank or delete all lines in the buffer.
+static void yank_all_lines(ViewerState *st) {
+    Buffer *b = &st->buffers[st->current_buffer];
+    char *snap = buffer_serialize(b);
+    if (!snap) return;
+    clipboard_copy_text(snap);
+    free(snap);
+    set_status(st, "Yanked all lines");
+}
+
+static void delete_all_lines(ViewerState *st) {
+    Buffer *b = &st->buffers[st->current_buffer];
+    char *snap = buffer_serialize(b);
+    if (snap) { clipboard_copy_text(snap); free(snap); }
+    undo_push(b);
+    for (int i = 0; i < b->line_count; i++) { free(b->lines[i]); b->lines[i] = NULL; }
+    b->line_count = 1;
+    b->lines[0] = strdup("");
+    b->dirty = 1;
+    st->cursor_line = 0;
+    st->cursor_col  = 0;
+    set_status(st, "Deleted all lines");
 }
 
 static void close_current_buffer(ViewerState *st) {
@@ -1341,10 +1457,8 @@ static void tmux_unset_window_opt(const char *opt) {
 }
 void tmux_toggle_lldb(const char *cwd) {
     if (!getenv("TMUX")) return;
-
     char pane[64] = {0};
     tmux_get_window_opt("@vic_lldb_pane", pane, sizeof(pane));
-
     // TOGGLE OFF
     if (pane[0] && tmux_pane_exists_simple(pane)) {
         char cmd[256];
@@ -1353,38 +1467,163 @@ void tmux_toggle_lldb(const char *cwd) {
         tmux_unset_window_opt("@vic_lldb_pane");
         return;
     }
-
     // stale option (pane died)
     if (pane[0] && !tmux_pane_exists_simple(pane)) {
         tmux_unset_window_opt("@vic_lldb_pane");
+        pane[0] = '\0';
+    }
+    // TOGGLE ON
+    char qcwd[2048];
+    sh_quote((cwd && *cwd) ? cwd : ".", qcwd, sizeof(qcwd));
+    // create the pane (it becomes active)
+    {
+        char cmd[4096];
+        snprintf(cmd, sizeof(cmd), "tmux split-window -h -p 10 -c %s 2>/dev/null", qcwd);
+        system(cmd);
+    }
+    // read the active pane id (that's the new one), then go back
+    {
+        FILE *fp = popen("tmux display-message -p '#{pane_id}' 2>/dev/null", "r");
+        if (!fp) return;
+        char newpane[64] = {0};
+        if (fgets(newpane, sizeof(newpane), fp)) {
+            chomp(newpane);
+            if (newpane[0]) {
+                tmux_set_window_opt("@vic_lldb_pane", newpane);
+                // Send the lldb command to the new pane
+                char lldb_cmd[512];
+                snprintf(lldb_cmd, sizeof(lldb_cmd),
+                         "tmux send-keys -t '%s' 'lldb ./bin/*' Enter 2>/dev/null", newpane);
+                system(lldb_cmd);
+            }
+        }
+        pclose(fp);
+        system("tmux last-pane 2>/dev/null");
+    }
+}
+void tmux_toggle_db(const char *cwd) {
+    if (!getenv("TMUX")) return;
+    char pane[64] = {0};
+    tmux_get_window_opt("@vic_db_pane", pane, sizeof(pane));
+    // TOGGLE OFF
+    if (pane[0] && tmux_pane_exists_simple(pane)) {
+        char cmd[256];
+        snprintf(cmd, sizeof(cmd), "tmux kill-pane -t '%s' 2>/dev/null", pane);
+        system(cmd);
+        tmux_unset_window_opt("@vic_db_pane");
+        return;
+    }
+    // stale option (pane died)
+    if (pane[0] && !tmux_pane_exists_simple(pane)) {
+        tmux_unset_window_opt("@vic_db_pane");
+        pane[0] = '\0';
+    }
+    // TOGGLE ON
+    char qcwd[2048];
+    sh_quote((cwd && *cwd) ? cwd : ".", qcwd, sizeof(qcwd));
+    // create the pane (it becomes active)
+    {
+        char cmd[4096];
+        snprintf(cmd, sizeof(cmd), "tmux split-window -h -p 40 -c %s 2>/dev/null", qcwd);
+        system(cmd);
+    }
+    // read the active pane id (that's the new one), then go back
+    {
+        FILE *fp = popen("tmux display-message -p '#{pane_id}' 2>/dev/null", "r");
+        if (!fp) return;
+        char newpane[64] = {0};
+        if (fgets(newpane, sizeof(newpane), fp)) {
+            chomp(newpane);
+            if (newpane[0]) {
+                tmux_set_window_opt("@vic_db_pane", newpane);
+                // Send the data command to the new pane
+                char db_cmd[512];
+                snprintf(db_cmd, sizeof(db_cmd),
+                         "tmux send-keys -t '%s' 'data-tui' Enter 2>/dev/null", newpane);
+                system(db_cmd);
+            }
+        }
+        pclose(fp);
+        system("tmux last-pane 2>/dev/null");
+    }
+}
+void tmux_toggle_peek(const char *cwd) {
+    if (!getenv("TMUX")) return;
+    char pane[64] = {0};
+    char shell_pane[64] = {0};
+    tmux_get_window_opt("@vic_peek_pane", pane, sizeof(pane));
+    tmux_get_window_opt("@vic_peek_shell_pane", shell_pane, sizeof(shell_pane));
+
+    // TOGGLE OFF
+    if (pane[0] && tmux_pane_exists_simple(pane)) {
+        char cmd[256];
+        // Kill shell pane first if it exists
+        if (shell_pane[0] && tmux_pane_exists_simple(shell_pane)) {
+            snprintf(cmd, sizeof(cmd), "tmux kill-pane -t '%s' 2>/dev/null", shell_pane);
+            system(cmd);
+        }
+        // Then kill the main peek pane
+        snprintf(cmd, sizeof(cmd), "tmux kill-pane -t '%s' 2>/dev/null", pane);
+        system(cmd);
+        tmux_unset_window_opt("@vic_peek_pane");
+        tmux_unset_window_opt("@vic_peek_shell_pane");
+        return;
+    }
+
+    // stale option (pane died)
+    if (pane[0] && !tmux_pane_exists_simple(pane)) {
+        tmux_unset_window_opt("@vic_peek_pane");
+        tmux_unset_window_opt("@vic_peek_shell_pane");
         pane[0] = '\0';
     }
 
     // TOGGLE ON
     char qcwd[2048];
     sh_quote((cwd && *cwd) ? cwd : ".", qcwd, sizeof(qcwd));
-
-    // create the pane (it becomes active)
+    // create the main peek pane (it becomes active)
     {
         char cmd[4096];
-snprintf(cmd, sizeof(cmd), "tmux split-window -h -p 20 -c %s 2>/dev/null", qcwd);
+        snprintf(cmd, sizeof(cmd), "tmux split-window -h -p 30 -c %s 2>/dev/null", qcwd);
         system(cmd);
     }
-
-    // read the active pane id (that’s the new one), then go back
+    // read the active pane id (that's the peek pane)
+    char newpane[64] = {0};
     {
         FILE *fp = popen("tmux display-message -p '#{pane_id}' 2>/dev/null", "r");
         if (!fp) return;
-
-        char newpane[64] = {0};
         if (fgets(newpane, sizeof(newpane), fp)) {
             chomp(newpane);
-            if (newpane[0]) tmux_set_window_opt("@vic_lldb_pane", newpane);
+            if (newpane[0]) tmux_set_window_opt("@vic_peek_pane", newpane);
         }
         pclose(fp);
-
-        system("tmux last-pane 2>/dev/null");
     }
+    // send peek command to the main pane
+    if (newpane[0]) {
+        char peek_cmd[512];
+        snprintf(peek_cmd, sizeof(peek_cmd),
+                 "tmux send-keys -t '%s' 'peek todo.md' Enter 2>/dev/null", newpane);
+        system(peek_cmd);
+    }
+    // split the peek pane vertically to create bottom shell (20% of peek pane)
+    {
+        char split_cmd[512];
+        snprintf(split_cmd, sizeof(split_cmd),
+                 "tmux split-window -t '%s' -v -p 30 -c %s 2>/dev/null", newpane, qcwd);
+        system(split_cmd);
+    }
+    // get the new shell pane id and save it
+    {
+        FILE *fp = popen("tmux display-message -p '#{pane_id}' 2>/dev/null", "r");
+        if (!fp) return;
+        char new_shell_pane[64] = {0};
+        if (fgets(new_shell_pane, sizeof(new_shell_pane), fp)) {
+            chomp(new_shell_pane);
+            if (new_shell_pane[0]) tmux_set_window_opt("@vic_peek_shell_pane", new_shell_pane);
+        }
+        pclose(fp);
+    }
+    // go back to the original pane
+    system("tmux last-pane 2>/dev/null");
 }
 void tmux_toggle_terminal(const char *cwd) {
     if (!getenv("TMUX")) return;
@@ -1418,7 +1657,7 @@ void tmux_toggle_terminal(const char *cwd) {
         system(cmd);
     }
 
-    // read the active pane id (that’s the new one), then go back
+    // read the active pane id (that's the new one), then go back
     {
         FILE *fp = popen("tmux display-message -p '#{pane_id}' 2>/dev/null", "r");
         if (!fp) return;
@@ -2181,10 +2420,13 @@ static void cmd_show_help(ViewerState *st) {
     fprintf(help_file, "dd              | Delete current line\n");
     fprintf(help_file, "d%%              | Delete to matching bracket\n");
     fprintf(help_file, "p               | Paste from clipboard\n");
+    fprintf(help_file, "p (in visual)   | Replace selection with clipboard\n");
     fprintf(help_file, "\n");
     fprintf(help_file, "=== VISUAL MODE ===\n");
     fprintf(help_file, "V               | Enter visual line mode\n");
     fprintf(help_file, "y (in visual)   | Yank selected lines\n");
+    fprintf(help_file, "d (in visual)   | Delete selected lines\n");
+    fprintf(help_file, "p (in visual)   | Replace selected lines with clipboard\n");
     fprintf(help_file, "ESC (in visual) | Exit visual mode\n");
     fprintf(help_file, "\n");
     fprintf(help_file, "=== SEARCH ===\n");
@@ -2192,6 +2434,10 @@ static void cmd_show_help(ViewerState *st) {
     fprintf(help_file, "n               | Next search match\n");
     fprintf(help_file, "N               | Previous search match\n");
     fprintf(help_file, ":noh            | Clear search highlighting\n");
+    fprintf(help_file, "\n");
+    fprintf(help_file, "=== ALL-LINES OPERATIONS ===\n");
+    fprintf(help_file, "%%y              | Yank all lines to clipboard\n");
+    fprintf(help_file, "%%d              | Delete all lines (yanks first)\n");
     fprintf(help_file, "\n");
     fprintf(help_file, "=== BUFFERS ===\n");
     fprintf(help_file, ":ls             | List and switch buffers (fzf)\n");
@@ -2356,9 +2602,7 @@ static void handle_input(ViewerState *st, int *running) {
     }
 
     if (st->mode != MODE_INSERT && ch == ':') {
-        Buffer *b = &st->buffers[st->current_buffer];
-
-    enter_command_mode(st);
+        enter_command_mode(st);
         return;
     }
 
@@ -2370,13 +2614,58 @@ static void handle_input(ViewerState *st, int *running) {
 
     Buffer *b = &st->buffers[st->current_buffer];
 
-    // Handle Visual mode
+    // -------------------------------------------------------
+    // VISUAL MODE
+    // -------------------------------------------------------
     if (st->mode == MODE_VISUAL) {
         if (ch == 27) {
             st->mode = MODE_NORMAL;
             st->op_pending = OP_NONE;
+            st->percent_pending = 0;
             return;
         }
+
+        // [CHANGE 3] d in visual: delete the selected lines
+        if (ch == 'd') {
+            char *deleted = delete_visual_lines(st);
+            if (deleted) {
+                clipboard_copy_text(deleted);
+                free(deleted);
+            }
+            st->mode = MODE_NORMAL;
+            st->op_pending = OP_NONE;
+            ensure_cursor_visible(st);
+            set_status(st, "Deleted selection");
+            return;
+        }
+
+        // [CHANGE 2] p in visual: replace selection with clipboard
+        if (ch == 'p') {
+            char *clip = clipboard_paste_text();
+            // Delete selection first (this also pushes undo)
+            char *deleted = delete_visual_lines(st);
+            free(deleted);
+            st->mode = MODE_NORMAL;
+            st->op_pending = OP_NONE;
+            if (clip) {
+                // paste_text_at_cursor calls undo_push internally; since we
+                // already pushed in delete_visual_lines, collapse to one step
+                // by inserting directly without a second undo snapshot.
+                for (const char *p = clip; *p; p++) {
+                    if (*p == '\n') insert_newline(b, &st->cursor_line, &st->cursor_col);
+                    else {
+                        insert_char_at(b, st->cursor_line, st->cursor_col, *p);
+                        st->cursor_col++;
+                    }
+                }
+                free(clip);
+                b->dirty = 1;
+            }
+            ensure_cursor_visible(st);
+            set_status(st, "Replaced selection");
+            return;
+        }
+
         if (ch == 'y') {
             visual_copy_to_clipboard(st);
             st->mode = MODE_NORMAL;
@@ -2410,15 +2699,35 @@ static void handle_input(ViewerState *st, int *running) {
             ensure_cursor_visible(st);
             return;
         }
+        return; // swallow unhandled keys in visual mode
     }
 
+    // -------------------------------------------------------
+    // NORMAL MODE — g-prefix
+    // -------------------------------------------------------
     if (st->g_pending) {
         st->g_pending = 0;
         if (ch == 'g') { st->cursor_line = 0; st->cursor_col = 0; ensure_cursor_visible(st); return; }
         if (ch == 't') { next_buffer(st); return; }
         if (ch == 'T') { prev_buffer(st); return; }
+        return;
     }
 
+    // -------------------------------------------------------
+    // NORMAL MODE — %-prefix  (%y = yank all, %d = delete all)
+    // -------------------------------------------------------
+    // [CHANGE 4/5]
+    if (st->percent_pending) {
+        st->percent_pending = 0;
+        if (ch == 'y') { yank_all_lines(st); return; }
+        if (ch == 'd') { delete_all_lines(st); ensure_cursor_visible(st); return; }
+        // Not a recognised follow-up: fall through and treat % as bracket jump
+        // (handled below in op_pending or switch)
+    }
+
+    // -------------------------------------------------------
+    // NORMAL MODE — operator pending (y / d already pressed)
+    // -------------------------------------------------------
     if (st->op_pending != OP_NONE) {
         if (ch == 27) { st->op_pending = OP_NONE; return; }
 
@@ -2476,16 +2785,19 @@ static void handle_input(ViewerState *st, int *running) {
         st->op_pending = OP_NONE;
     }
 
+    // -------------------------------------------------------
+    // NORMAL MODE — main key dispatch
+    // -------------------------------------------------------
     switch (ch) {
         case 'q': *running = 0; return;
-        case 27: clear_search(st); st->op_pending = OP_NONE; set_status(st, "noh"); return;
+        case 27: clear_search(st); st->op_pending = OP_NONE; st->percent_pending = 0; set_status(st, "noh"); return;
         case 'x': close_current_buffer(st); return;
-       case 'i':
-    st->mode = MODE_INSERT;
-    st->insert_undo_armed = 0;
-    return;
+        case 'i':
+            st->mode = MODE_INSERT;
+            st->insert_undo_armed = 0;
+            return;
 
-         case 'V':
+        case 'V':
             st->mode = MODE_VISUAL;
             st->vis_start = st->cursor_line;
             st->vis_end = st->cursor_line;
@@ -2495,31 +2807,45 @@ static void handle_input(ViewerState *st, int *running) {
         case 'N': prev_match(st); ensure_cursor_visible(st); return;
         case 'u': do_undo(st); ensure_cursor_visible(st); return;
         case 't': {
- char cwd[1024];
-    get_cwd(cwd, sizeof(cwd));
-
-    def_prog_mode();
-    endwin();
-
-    tmux_toggle_terminal(cwd);
-
-    reset_prog_mode();
-    refresh();
-    return;
-}
+            char cwd[1024];
+            get_cwd(cwd, sizeof(cwd));
+            def_prog_mode();
+            endwin();
+            tmux_toggle_terminal(cwd);
+            reset_prog_mode();
+            refresh();
+            return;
+        }
+        case 'D': {
+            char cwd[1024];
+            get_cwd(cwd, sizeof(cwd));
+            def_prog_mode();
+            endwin();
+            tmux_toggle_db(cwd);
+            reset_prog_mode();
+            refresh();
+            return;
+        }
+        case 'P': {
+            char cwd[1024];
+            get_cwd(cwd, sizeof(cwd));
+            def_prog_mode();
+            endwin();
+            tmux_toggle_peek(cwd);
+            reset_prog_mode();
+            refresh();
+            return;
+        }
         case '!': {
- char cwd[1024];
-    get_cwd(cwd, sizeof(cwd));
-
-    def_prog_mode();
-    endwin();
-
-    tmux_toggle_lldb(cwd);
-
-    reset_prog_mode();
-    refresh();
-    return;
-}
+            char cwd[1024];
+            get_cwd(cwd, sizeof(cwd));
+            def_prog_mode();
+            endwin();
+            tmux_toggle_lldb(cwd);
+            reset_prog_mode();
+            refresh();
+            return;
+        }
         case 18:  do_redo(st); ensure_cursor_visible(st); return; // Ctrl+R
         case 'p': {
             char *clip = clipboard_paste_text();
@@ -2579,15 +2905,11 @@ static void handle_input(ViewerState *st, int *running) {
             st->op_start_line = st->cursor_line;
             st->op_start_col  = st->cursor_col;
             return;
+        // [CHANGE 4/5] '%' in normal mode: set percent_pending so the next
+        // key ('y' or 'd') can trigger yank-all / delete-all.  If the next
+        // key is something else, fall through to the bracket-jump behaviour.
         case '%': {
-            int toL,toC,fromL,fromC;
-            if (jump_percent(st, &toL,&toC,&fromL,&fromC)) {
-                st->cursor_line = toL;
-                st->cursor_col = toC;
-                ensure_cursor_visible(st);
-            } else {
-                set_status(st, "No match");
-            }
+            st->percent_pending = 1;
             return;
         }
         default:
@@ -2617,6 +2939,7 @@ int main(int argc, char *argv[]) {
     st->wrap_enabled = 1;
     st->mode = MODE_NORMAL;
     st->g_pending = 0;
+    st->percent_pending = 0;
     st->search_highlight = 0;
     st->op_pending = OP_NONE;
 
