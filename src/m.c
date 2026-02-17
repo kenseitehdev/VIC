@@ -1,5 +1,10 @@
 // vic
+// =============================
+// vic: types / config
+// =============================
+
 #define _POSIX_C_SOURCE 200809L
+
 #include <ncurses.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +21,7 @@
 #define MAX_BUFFERS   20
 #define MAX_LINES     100000
 #define MAX_LINE_LEN  2048
+
 #define UNDO_MAX      5
 #define REDO_MAX      5
 #define CMDHIST_MAX   5
@@ -36,13 +42,15 @@ typedef struct {
 typedef struct {
     char *lines[MAX_LINES];
     int line_count;
-    char filepath[1024];     // empty => [No Name]
+    char filepath[1024];    // empty => [No Name]
     Language lang;
-    int scroll_offset;       // top logical line
+    int scroll_offset;      // top logical line
     int is_active;
     int dirty;
+
     char *undo[UNDO_MAX];
     int undo_len;
+
     char *redo[REDO_MAX];
     int redo_len;
 } Buffer;
@@ -64,30 +72,45 @@ typedef struct {
     Buffer buffers[MAX_BUFFERS];
     int buffer_count;
     int current_buffer;
+
     int cursor_line;
     int cursor_col;
+
     int vis_start;
     int vis_end;
+
     char search_term[256];
     int search_match_count;
     int current_match;
     int search_highlight;
+
     int show_line_numbers;
     int wrap_enabled;
+
     InputMode mode;
+
     int g_pending;
+
     char cmdline[512];
     int cmdlen;
+
     char *cmdhist[CMDHIST_MAX];
     int cmdhist_len;
     int cmdhist_pos;
+
     char status_msg[256];
     int status_ticks;
+
     Operator op_pending;
     int op_start_line;
     int op_start_col;
+
     int free_scroll;
+
     char terminal_pane_id[128];
+
+    // --- needed by your insert-mode undo coalescing ---
+    int insert_undo_armed;
 } ViewerState;
 
 #define COLOR_NORMAL       1
@@ -101,7 +124,7 @@ typedef struct {
 #define COLOR_SEARCH_HL    9
 
 static void cmd_show_help(ViewerState *st);
-
+static Language detect_language(const char *filepath);
 static void set_status(ViewerState *st, const char *msg) {
     if (!st) return;
     snprintf(st->status_msg, sizeof(st->status_msg), "%s", msg ? msg : "");
@@ -2274,32 +2297,42 @@ static void prompt_search(ViewerState *st) {
     find_all_matches(st);
     jump_to_first_match(st);
 }
-
+static inline void insert_undo_maybe_push(ViewerState *st, Buffer *b) {
+    if (!st->insert_undo_armed) {
+        undo_push(b);
+        st->insert_undo_armed = 1;
+    }
+}
 static void handle_insert_key(ViewerState *st, int ch) {
     Buffer *b = &st->buffers[st->current_buffer];
 
-    if (ch == KEY_LEFT) { move_left(st); return; }
-    if (ch == KEY_RIGHT){ move_right(st); return; }
-    if (ch == KEY_UP)   { move_up(st); return; }
-    if (ch == KEY_DOWN) { move_down(st); return; }
-    if (ch == 27) { st->mode = MODE_NORMAL; return; }
+    if (ch == KEY_LEFT)  { move_left(st);  return; }
+    if (ch == KEY_RIGHT) { move_right(st); return; }
+    if (ch == KEY_UP)    { move_up(st);    return; }
+    if (ch == KEY_DOWN)  { move_down(st);  return; }
+
+    if (ch == 27) { // ESC
+        st->mode = MODE_NORMAL;
+        st->insert_undo_armed = 0;
+        return;
+    }
 
     if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-        undo_push(b);
+        insert_undo_maybe_push(st, b);
         delete_char_before(b, &st->cursor_line, &st->cursor_col);
         ensure_cursor_bounds(st);
         return;
     }
 
     if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
-        undo_push(b);
+        insert_undo_maybe_push(st, b);
         insert_newline(b, &st->cursor_line, &st->cursor_col);
         ensure_cursor_bounds(st);
         return;
     }
 
     if (ch == '\t') {
-        undo_push(b);
+        insert_undo_maybe_push(st, b);
         for (int i = 0; i < 4; i++) {
             insert_char_at(b, st->cursor_line, st->cursor_col, ' ');
             st->cursor_col++;
@@ -2308,13 +2341,12 @@ static void handle_insert_key(ViewerState *st, int ch) {
     }
 
     if (isprint(ch)) {
-        undo_push(b);
+        insert_undo_maybe_push(st, b);
         insert_char_at(b, st->cursor_line, st->cursor_col, (char)ch);
         st->cursor_col++;
         return;
     }
 }
-
 static void handle_input(ViewerState *st, int *running) {
     int ch = getch();
 
@@ -2324,7 +2356,9 @@ static void handle_input(ViewerState *st, int *running) {
     }
 
     if (st->mode != MODE_INSERT && ch == ':') {
-        enter_command_mode(st);
+        Buffer *b = &st->buffers[st->current_buffer];
+
+    enter_command_mode(st);
         return;
     }
 
@@ -2446,8 +2480,12 @@ static void handle_input(ViewerState *st, int *running) {
         case 'q': *running = 0; return;
         case 27: clear_search(st); st->op_pending = OP_NONE; set_status(st, "noh"); return;
         case 'x': close_current_buffer(st); return;
-        case 'i': st->mode = MODE_INSERT; return;
-        case 'V':
+       case 'i':
+    st->mode = MODE_INSERT;
+    st->insert_undo_armed = 0;
+    return;
+
+         case 'V':
             st->mode = MODE_VISUAL;
             st->vis_start = st->cursor_line;
             st->vis_end = st->cursor_line;

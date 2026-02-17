@@ -39,20 +39,20 @@ typedef struct {
 } WrappedLine;
 
 typedef struct {
-    DynamicLine *lines;   
+    DynamicLine *lines;
     int line_count;
-    int line_capacity;         
+    int line_capacity;
     char filepath[1024];
     Language lang;
     int scroll_offset;
     int is_active;
     int dirty;
-    char **undo;             
+    char **undo;
     int undo_len;
-    int undo_capacity;         
-    char **redo;               
+    int undo_capacity;
+    char **redo;
     int redo_len;
-    int redo_capacity;         
+    int redo_capacity;
 } Buffer;
 typedef enum {
     MODE_NORMAL = 0,
@@ -95,7 +95,8 @@ typedef struct {
     int op_start_col;
     int free_scroll;
     char terminal_pane_id[128];
-    int left_insert_mode;        
+    int left_insert_mode;
+    int insert_undo_armed;
 } ViewerState;
 #define COLOR_NORMAL       1
 #define COLOR_KEYWORD      2
