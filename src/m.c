@@ -565,14 +565,16 @@ static char *buffer_serialize(const Buffer *b) {
     for (int i = 0; i < b->line_count; i++) total += strlen(b->lines[i]) + 1;
     char *out = (char*)malloc(total + 1);
     if (!out) return NULL;
-    out[0] = '\0';
+    char *wp = out;
     for (int i = 0; i < b->line_count; i++) {
-        strcat(out, b->lines[i]);
-        if (i != b->line_count - 1) strcat(out, "\n");
+        size_t len = strlen(b->lines[i]);
+        memcpy(wp, b->lines[i], len);
+        wp += len;
+        if (i != b->line_count - 1) *wp++ = '\n';
     }
+    *wp = '\0';
     return out;
 }
-
 static void buffer_deserialize(Buffer *b, const char *text) {
     if (!b) return;
     for (int i = 0; i < b->line_count; i++) { free(b->lines[i]); b->lines[i] = NULL; }
@@ -1461,10 +1463,11 @@ void tmux_toggle_lldb(const char *cwd) {
     tmux_get_window_opt("@vic_lldb_pane", pane, sizeof(pane));
     // TOGGLE OFF
     if (pane[0] && tmux_pane_exists_simple(pane)) {
+        char qpane[256];
+        shell_quote_single(qpane, sizeof(qpane), pane);
         char cmd[256];
-        snprintf(cmd, sizeof(cmd), "tmux kill-pane -t '%s' 2>/dev/null", pane);
+        snprintf(cmd, sizeof(cmd), "tmux kill-pane -t %s 2>/dev/null", qpane);
         system(cmd);
-        tmux_unset_window_opt("@vic_lldb_pane");
         return;
     }
     // stale option (pane died)
@@ -1492,9 +1495,10 @@ void tmux_toggle_lldb(const char *cwd) {
                 tmux_set_window_opt("@vic_lldb_pane", newpane);
                 // Send the lldb command to the new pane
                 char lldb_cmd[512];
+char qnewpane[256];
+                shell_quote_single(qnewpane, sizeof(qnewpane), newpane);
                 snprintf(lldb_cmd, sizeof(lldb_cmd),
-                         "tmux send-keys -t '%s' 'lldb ./bin/*' Enter 2>/dev/null", newpane);
-                system(lldb_cmd);
+                         "tmux send-keys -t %s 'lldb ./bin/*' Enter 2>/dev/null", qnewpane);                system(lldb_cmd);
             }
         }
         pclose(fp);
@@ -1507,8 +1511,10 @@ void tmux_toggle_db(const char *cwd) {
     tmux_get_window_opt("@vic_db_pane", pane, sizeof(pane));
     // TOGGLE OFF
     if (pane[0] && tmux_pane_exists_simple(pane)) {
+        char qpane[256];
+        shell_quote_single(qpane, sizeof(qpane), pane);
         char cmd[256];
-        snprintf(cmd, sizeof(cmd), "tmux kill-pane -t '%s' 2>/dev/null", pane);
+        snprintf(cmd, sizeof(cmd), "tmux kill-pane -t %s 2>/dev/null", qpane);
         system(cmd);
         tmux_unset_window_opt("@vic_db_pane");
         return;
@@ -1538,8 +1544,10 @@ void tmux_toggle_db(const char *cwd) {
                 tmux_set_window_opt("@vic_db_pane", newpane);
                 // Send the data command to the new pane
                 char db_cmd[512];
+                char qnewpane[256];
+                shell_quote_single(qnewpane, sizeof(qnewpane), newpane);
                 snprintf(db_cmd, sizeof(db_cmd),
-                         "tmux send-keys -t '%s' 'data-tui' Enter 2>/dev/null", newpane);
+                         "tmux send-keys -t %s 'data-tui' Enter 2>/dev/null", qnewpane);
                 system(db_cmd);
             }
         }
@@ -1558,12 +1566,16 @@ void tmux_toggle_peek(const char *cwd) {
     if (pane[0] && tmux_pane_exists_simple(pane)) {
         char cmd[256];
         // Kill shell pane first if it exists
-        if (shell_pane[0] && tmux_pane_exists_simple(shell_pane)) {
-            snprintf(cmd, sizeof(cmd), "tmux kill-pane -t '%s' 2>/dev/null", shell_pane);
+if (shell_pane[0] && tmux_pane_exists_simple(shell_pane)) {
+            char qshell[256];
+            shell_quote_single(qshell, sizeof(qshell), shell_pane);
+            snprintf(cmd, sizeof(cmd), "tmux kill-pane -t %s 2>/dev/null", qshell);
             system(cmd);
         }
         // Then kill the main peek pane
-        snprintf(cmd, sizeof(cmd), "tmux kill-pane -t '%s' 2>/dev/null", pane);
+        char qpane[256];
+        shell_quote_single(qpane, sizeof(qpane), pane);
+        snprintf(cmd, sizeof(cmd), "tmux kill-pane -t %s 2>/dev/null", qpane);
         system(cmd);
         tmux_unset_window_opt("@vic_peek_pane");
         tmux_unset_window_opt("@vic_peek_shell_pane");
@@ -1600,15 +1612,18 @@ void tmux_toggle_peek(const char *cwd) {
     // send peek command to the main pane
     if (newpane[0]) {
         char peek_cmd[512];
+        char qnewpane[256];
+        shell_quote_single(qnewpane, sizeof(qnewpane), newpane);
         snprintf(peek_cmd, sizeof(peek_cmd),
-                 "tmux send-keys -t '%s' 'peek todo.md' Enter 2>/dev/null", newpane);
+                 "tmux send-keys -t %s 'peek todo.md' Enter 2>/dev/null", qnewpane);
         system(peek_cmd);
     }
     // split the peek pane vertically to create bottom shell (20% of peek pane)
     {
         char split_cmd[512];
-        snprintf(split_cmd, sizeof(split_cmd),
-                 "tmux split-window -t '%s' -v -p 30 -c %s 2>/dev/null", newpane, qcwd);
+        char qnewpane[256];
+snprintf(split_cmd, sizeof(split_cmd),
+                 "tmux split-window -t %s -v -p 30 -c %s 2>/dev/null", qnewpane, qcwd);
         system(split_cmd);
     }
     // get the new shell pane id and save it
@@ -1633,8 +1648,10 @@ void tmux_toggle_terminal(const char *cwd) {
 
     // TOGGLE OFF
     if (pane[0] && tmux_pane_exists_simple(pane)) {
+        char qpane[256];
+        shell_quote_single(qpane, sizeof(qpane), pane);
         char cmd[256];
-        snprintf(cmd, sizeof(cmd), "tmux kill-pane -t '%s' 2>/dev/null", pane);
+        snprintf(cmd, sizeof(cmd), "tmux kill-pane -t %s 2>/dev/null", qpane);
         system(cmd);
         tmux_unset_window_opt("@vic_term_pane");
         return;
