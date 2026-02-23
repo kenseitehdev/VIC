@@ -50,9 +50,13 @@ typedef struct {
 } WrappedLine;
 
 typedef struct {
-    char **lines;
+    char **lines;        // plain (ANSI stripped) used for editing/search/syntax highlight
     int line_count;
     int line_cap;
+
+    char **raw_lines;    // original text as loaded (may contain ANSI) used ONLY for rendering
+    int raw_cap;
+    int raw_has_ansi;    // any ESC seen at load time
 
     char filepath[1024];
     Language lang;
@@ -66,7 +70,6 @@ typedef struct {
     int redo_len;
     int redo_cap;
 } Buffer;
-
 typedef enum {
     MODE_NORMAL = 0,
     MODE_INSERT,
@@ -135,9 +138,11 @@ typedef struct {
 #define COLOR_STATUS       7
 #define COLOR_COPY_SELECT  8
 #define COLOR_SEARCH_HL    9
+
 static void handle_insert_key(ViewerState *st, int ch);
 static void cmd_show_help(ViewerState *st);
 static Language detect_language(const char *filepath);
+
 // -----------------------------
 // Temp file tracking + cleanup
 // -----------------------------
@@ -159,12 +164,177 @@ static int  g_temp_count = 0;
 static volatile sig_atomic_t g_exit_signal = 0;
 static char *buffer_serialize(const Buffer *b);
 static void  buffer_deserialize(Buffer *b, const char *text);
+
+static const char *highlight_lang(Language l)
+{
+    switch (l) {
+        case LANG_C: return "c";
+        case LANG_CPP: return "cpp";
+        case LANG_PYTHON: return "python";
+        case LANG_JAVA: return "java";
+        case LANG_JS: return "javascript";
+        case LANG_TS: return "typescript";
+        case LANG_HTML: return "html";
+        case LANG_CSS: return "css";
+        case LANG_SHELL: return "bash";
+        case LANG_MARKDOWN: return "markdown";
+        case LANG_MAN: return "man";
+        case LANG_RUST: return "rust";
+        case LANG_GO: return "go";
+        case LANG_RUBY: return "ruby";
+        case LANG_PHP: return "php";
+        case LANG_SQL: return "sql";
+        case LANG_JSON: return "json";
+        case LANG_XML: return "xml";
+        case LANG_YAML: return "yaml";
+        default: return "txt";
+    }
+}
+
+// -----------------------------
+// ANSI color-pair management (for draw_ansi_line)
+// -----------------------------
+typedef struct {
+    short fg, bg;
+    short pair_id;
+} AnsiPairEnt;
+
+#define ANSI_PAIR_MAX 512
+static AnsiPairEnt g_ansi_pairs[ANSI_PAIR_MAX];
+static int g_ansi_pair_count = 0;
+
+static void ansi_pairs_reset(void) {
+    g_ansi_pair_count = 0;
+}
+
+static int ansi_map_256_to_curses(int c) {
+    if (c < 0) return -1;
+    if (COLORS >= 256) return c;
+    if (c < 8) return c;
+    if (c >= 8 && c < 16) return (c - 8);
+    return (c % 8);
+}
+
+static short ansi_get_pair(short fg, short bg) {
+    if (fg < 0) fg = -1;
+    if (bg < 0) bg = -1;
+    for (int i = 0; i < g_ansi_pair_count; i++) {
+        if (g_ansi_pairs[i].fg == fg && g_ansi_pairs[i].bg == bg)
+            return g_ansi_pairs[i].pair_id;
+    }
+    /* allocate new pair; start at 20 to avoid stomping on our fixed pairs 1..9 */
+    short next = (short)(g_ansi_pair_count + 20);
+    if (next >= COLOR_PAIRS) return 0;
+    init_pair(next, fg, bg);
+    if (g_ansi_pair_count < ANSI_PAIR_MAX) {
+        g_ansi_pairs[g_ansi_pair_count++] = (AnsiPairEnt){ .fg = fg, .bg = bg, .pair_id = next };
+    }
+    return next;
+}
+
+typedef struct {
+    int fg;   /* -1 = default */
+    int bg;   /* -1 = default */
+    int bold;
+    int ul;
+    int ital;
+} AnsiState;
+
+static void ansi_state_reset(AnsiState *st) {
+    st->fg = -1; st->bg = -1;
+    st->bold = st->ul = st->ital = 0;
+}
+
+static void ansi_state_apply(const AnsiState *st) {
+    short fg = (short)ansi_map_256_to_curses(st->fg);
+    short bg = (short)ansi_map_256_to_curses(st->bg);
+    short pair = ansi_get_pair(fg, bg);
+    attrset(COLOR_PAIR(pair));
+    if (st->bold) attron(A_BOLD);
+    if (st->ul)   attron(A_UNDERLINE);
+#ifdef A_ITALIC
+    if (st->ital) attron(A_ITALIC);
+#endif
+}
+
+static int ansi_clamp8(int x) { return (x < 0) ? 0 : (x > 7 ? 7 : x); }
+
+/* Draw a single line string that may contain ANSI escape sequences.
+ * Uses ncurses mvaddch so it integrates with the rest of the TUI. */
+static void draw_ansi_line(const char *s, int y, int x, int max_x) {
+    if (!s) return;
+    AnsiState st;
+    ansi_state_reset(&st);
+    ansi_state_apply(&st);
+
+    for (int i = 0; s[i] && x < max_x; ) {
+        unsigned char c = (unsigned char)s[i];
+
+        if (c == 0x1B && s[i+1] == '[') {
+            i += 2;
+            int params[16], pn = 0, val = 0, have = 0;
+
+            while (s[i] && pn < 16) {
+                if (isdigit((unsigned char)s[i])) {
+                    val = val * 10 + (s[i] - '0');
+                    have = 1;
+                    i++;
+                } else if (s[i] == ';') {
+                    params[pn++] = have ? val : 0;
+                    val = 0; have = 0;
+                    i++;
+                } else if (s[i] == 'm') {
+                    params[pn++] = have ? val : 0;
+                    i++;
+                    break;
+                } else {
+                    /* skip unknown CSI sequence */
+                    while (s[i] && s[i] != 'm') i++;
+                    if (s[i] == 'm') i++;
+                    pn = 0;
+                    break;
+                }
+            }
+
+            if (pn == 0) { ansi_state_reset(&st); ansi_state_apply(&st); continue; }
+
+            for (int k = 0; k < pn; k++) {
+                int p = params[k];
+                if      (p == 0)  ansi_state_reset(&st);
+                else if (p == 1)  st.bold = 1;
+                else if (p == 3)  st.ital = 1;
+                else if (p == 4)  st.ul   = 1;
+                else if (p == 22) st.bold = 0;
+                else if (p == 23) st.ital = 0;
+                else if (p == 24) st.ul   = 0;
+                else if (p >= 30 && p <= 37) st.fg = ansi_clamp8(p - 30);
+                else if (p == 39) st.fg = -1;
+                else if (p >= 40 && p <= 47) st.bg = ansi_clamp8(p - 40);
+                else if (p == 49) st.bg = -1;
+                else if (p >= 90 && p <= 97)  st.fg = ansi_clamp8(p - 90) + 8;
+                else if (p >= 100 && p <= 107) st.bg = ansi_clamp8(p - 100) + 8;
+                else if (p == 38 && k + 2 < pn && params[k+1] == 5) { st.fg = params[k+2]; k += 2; }
+                else if (p == 48 && k + 2 < pn && params[k+1] == 5) { st.bg = params[k+2]; k += 2; }
+            }
+            ansi_state_apply(&st);
+            continue;
+        }
+
+        mvaddch(y, x++, c);
+        i++;
+    }
+
+    /* restore default attrs after the line */
+    attrset(COLOR_PAIR(COLOR_NORMAL));
+}
+
 static int is_dir_path(const char *path) {
     if (!path || !*path) return 0;
     struct stat st;
     if (stat(path, &st) != 0) return 0;
     return S_ISDIR(st.st_mode);
 }
+
 static char *pick_file(void) {
     int have_ff  = check_command_exists("ff");
     int have_fzf = check_command_exists("fzf");
@@ -195,8 +365,6 @@ static char *pick_file(void) {
     char tmp_template[] = "/tmp/nbl_vic_pick_XXXXXX";
     int fdout = mkstemp(tmp_template);
     if (fdout < 0) return NULL;
-    /* Do NOT close fdout - keep it open so we read back through our own fd
-     * after the shell writes, eliminating the TOCTOU window. */
 
     temp_register_path(tmp_template);
 
@@ -252,7 +420,6 @@ static char *pick_file(void) {
         return NULL;
     }
 
-    /* Seek back to the start and read through our own fd - no re-open by name */
     if (lseek(fdout, 0, SEEK_SET) < 0) {
         close(fdout);
         unlink(tmp_template);
@@ -274,7 +441,7 @@ static char *pick_file(void) {
         temp_forget_path(tmp_template);
         return NULL;
     }
-    fclose(f); /* also closes fdout */
+    fclose(f);
 
     unlink(tmp_template);
     temp_forget_path(tmp_template);
@@ -283,6 +450,40 @@ static char *pick_file(void) {
     if (buf[0] == '\0') return NULL;
     return safe_strdup(buf);
 }
+
+static int line_has_ansi_esc(const char *s) {
+    if (!s) return 0;
+    for (; *s; s++) {
+        if ((unsigned char)*s == 0x1B) return 1;
+    }
+    return 0;
+}
+
+static int buf_ensure_raw_capacity(Buffer *b, int needed) {
+    if (needed <= b->raw_cap) return 1;
+    int new_cap = b->raw_cap ? b->raw_cap : INITIAL_LINE_CAP;
+    while (new_cap < needed) new_cap *= 2;
+    char **np = (char**)realloc(b->raw_lines, (size_t)new_cap * sizeof(char*));
+    if (!np) return 0;
+    b->raw_lines = np;
+    b->raw_cap = new_cap;
+    return 1;
+}
+
+static void buffer_drop_raw(Buffer *b) {
+    if (!b) return;
+    if (b->raw_lines) {
+        for (int i = 0; i < b->line_count; i++) {
+            free(b->raw_lines[i]);
+            b->raw_lines[i] = NULL;
+        }
+        free(b->raw_lines);
+    }
+    b->raw_lines = NULL;
+    b->raw_cap = 0;
+    b->raw_has_ansi = 0;
+}
+
 static char *pick_file_from_dir_raw(const char *dir) {
     if (!dir || !*dir) dir = ".";
     int have_ff  = check_command_exists("ff");
@@ -309,8 +510,6 @@ static char *pick_file_from_dir_raw(const char *dir) {
     char tmp_template[] = "/tmp/nbl_pick_dir_XXXXXX";
     int fdout = mkstemp(tmp_template);
     if (fdout < 0) return NULL;
-    /* Do NOT close fdout - keep it open so we read back through our own fd
-     * after the shell writes, eliminating the TOCTOU window. */
 
     temp_register_path(tmp_template);
 
@@ -371,7 +570,6 @@ static char *pick_file_from_dir_raw(const char *dir) {
         return NULL;
     }
 
-    /* Seek back to the start and read through our own fd - no re-open by name */
     if (lseek(fdout, 0, SEEK_SET) < 0) {
         close(fdout);
         unlink(tmp_template);
@@ -393,7 +591,7 @@ static char *pick_file_from_dir_raw(const char *dir) {
         temp_forget_path(tmp_template);
         return NULL;
     }
-    fclose(f); /* also closes fdout */
+    fclose(f);
 
     unlink(tmp_template);
     temp_forget_path(tmp_template);
@@ -403,6 +601,7 @@ static char *pick_file_from_dir_raw(const char *dir) {
 
     return safe_strdup(buf);
 }
+
 static void temp_register_path(const char *path) {
     if (!path || !*path) return;
     if (g_temp_count >= VIC_MAX_TEMP) return;
@@ -434,13 +633,9 @@ static void on_signal_request_exit(int sig) {
     g_exit_signal = sig;
 }
 
-/* Crash handler: clean up temp files, restore terminal, then re-raise so the
- * default action (core dump, abnormal exit status) still happens.
- * Async-signal-safe: only calls unlink(), write(), endwin() approximated via
- * reset, and raise(). stdio/malloc are not used here. */
 static void on_signal_crash(int sig) {
-    temp_cleanup_all();  /* unlink() is async-signal-safe */
-    endwin();            /* best-effort terminal restore */
+    temp_cleanup_all();
+    endwin();
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -456,15 +651,10 @@ static void install_exit_signal_handlers(void) {
     sigaction(SIGHUP,  &sa, NULL);
     sigaction(SIGQUIT, &sa, NULL);
 
-    /* Crash signals: clean temp files and restore terminal before dying.
-     * Re-raise with SIG_DFL so the process still exits with the right status
-     * and core dump behaviour is preserved. */
     struct sigaction sa_crash;
     memset(&sa_crash, 0, sizeof(sa_crash));
     sa_crash.sa_handler = on_signal_crash;
     sigemptyset(&sa_crash.sa_mask);
-    /* SA_RESETHAND: automatically reset to SIG_DFL after first invocation,
-     * preventing infinite loops if cleanup itself faults. */
     sa_crash.sa_flags = SA_RESETHAND;
 
     sigaction(SIGSEGV, &sa_crash, NULL);
@@ -472,6 +662,7 @@ static void install_exit_signal_handlers(void) {
     sigaction(SIGBUS,  &sa_crash, NULL);
     sigaction(SIGFPE,  &sa_crash, NULL);
 }
+
 static void set_status(ViewerState *st, const char *msg) {
     if (!st) return;
     snprintf(st->status_msg, sizeof(st->status_msg), "%s", msg ? msg : "");
@@ -544,12 +735,14 @@ static void manual_buffer_list_fallback(ViewerState *st) {
     reset_prog_mode();
     refresh();
 }
+
 static void get_cwd(char *out, size_t out_len) {
     if (!out || out_len == 0) return;
     if (!getcwd(out, out_len)) {
         snprintf(out, out_len, ".");
     }
 }
+
 static void strip_ansi(char *s) {
     char *d = s;
     for (char *p = s; *p; ) {
@@ -606,6 +799,185 @@ static Language detect_language(const char *filepath) {
     return LANG_NONE;
 }
 
+// -----------------------------
+// ANSI-aware wrapping (for raw_lines)
+// Keeps escape sequences intact and replays current SGR at segment starts.
+// -----------------------------
+
+static int ansi_seq_len_osc(const char *s) {
+    // OSC: ESC ] ... BEL  OR  ESC ] ... ESC \
+    if (!s || (unsigned char)s[0] != 0x1B || s[1] != ']') return 0;
+    int i = 2;
+    while (s[i]) {
+        if ((unsigned char)s[i] == 0x07) { // BEL
+            return i + 1;
+        }
+        if ((unsigned char)s[i] == 0x1B && s[i+1] == '\\') { // ST
+            return i + 2;
+        }
+        i++;
+    }
+    return i;
+}
+
+static int ansi_seq_len_csi(const char *s) {
+    // CSI: ESC [ ... <final byte @..~>
+    if (!s || (unsigned char)s[0] != 0x1B || s[1] != '[') return 0;
+    int i = 2;
+    while (s[i]) {
+        unsigned char c = (unsigned char)s[i];
+        if (c >= '@' && c <= '~') return i + 1;
+        i++;
+    }
+    return i;
+}
+
+static int is_printable_cell(unsigned char c) {
+    // We treat tabs as 1 cell to keep it simple (your editor likely expands elsewhere).
+    return (c >= 0x20 && c != 0x7F);
+}
+
+static WrappedLine ansi_wrap_line(const char *line, int width) {
+    WrappedLine out = (WrappedLine){0, NULL};
+    if (!line || width <= 0) return out;
+
+    // dynamic segment list
+    int seg_cap = 8;
+    out.segments = (char**)calloc((size_t)seg_cap, sizeof(char*));
+    if (!out.segments) return (WrappedLine){0, NULL};
+
+    // current segment buffer
+    size_t buf_cap = 256;
+    size_t buf_len = 0;
+    char *buf = (char*)malloc(buf_cap);
+    if (!buf) { free(out.segments); return (WrappedLine){0, NULL}; }
+    buf[0] = '\0';
+
+    // Track the "current" SGR state as the last CSI ... m sequence seen.
+    // We replay it at the start of a new wrapped segment.
+    char cur_sgr[128];
+    cur_sgr[0] = '\0';
+
+    int cells = 0;
+
+    // helper to append bytes to buf
+    #define APPEND_BYTES(ptr, nbytes) do { \
+        size_t _n = (size_t)(nbytes); \
+        if (buf_len + _n + 1 > buf_cap) { \
+            while (buf_len + _n + 1 > buf_cap) buf_cap *= 2; \
+            char *_nb = (char*)realloc(buf, buf_cap); \
+            if (!_nb) goto oom; \
+            buf = _nb; \
+        } \
+        memcpy(buf + buf_len, (ptr), _n); \
+        buf_len += _n; \
+        buf[buf_len] = '\0'; \
+    } while (0)
+
+    // helper to flush segment
+    #define FLUSH_SEG() do { \
+        if (out.count >= seg_cap) { \
+            int _nc = seg_cap * 2; \
+            char **_ns = (char**)realloc(out.segments, (size_t)_nc * sizeof(char*)); \
+            if (!_ns) goto oom; \
+            out.segments = _ns; \
+            memset(out.segments + seg_cap, 0, (size_t)(seg_cap) * sizeof(char*)); \
+            seg_cap = _nc; \
+        } \
+        out.segments[out.count++] = safe_strdup(buf_len ? buf : ""); \
+        buf_len = 0; \
+        buf[0] = '\0'; \
+        cells = 0; \
+        if (cur_sgr[0]) { \
+            APPEND_BYTES(cur_sgr, strlen(cur_sgr)); \
+        } \
+    } while (0)
+
+    // Start segment with current sgr (none initially)
+    // (nothing to do)
+
+    for (int i = 0; line[i]; ) {
+        unsigned char c = (unsigned char)line[i];
+
+        // ANSI escape
+        if (c == 0x1B) {
+            int n = 0;
+
+            if (line[i+1] == ']') {
+                n = ansi_seq_len_osc(line + i);
+                if (n <= 0) n = 1;
+                APPEND_BYTES(line + i, n);
+                i += n;
+                continue;
+            }
+
+            if (line[i+1] == '[') {
+                n = ansi_seq_len_csi(line + i);
+                if (n <= 0) n = 1;
+
+                // If this is an SGR (ends with 'm'), capture it as current state.
+                if (n > 2 && line[i + n - 1] == 'm') {
+                    int copy = n;
+                    if (copy >= (int)sizeof(cur_sgr)) copy = (int)sizeof(cur_sgr) - 1;
+                    memcpy(cur_sgr, line + i, (size_t)copy);
+                    cur_sgr[copy] = '\0';
+                }
+
+                APPEND_BYTES(line + i, n);
+                i += n;
+                continue;
+            }
+
+            // unknown ESC sequence: just copy ESC
+            APPEND_BYTES(line + i, 1);
+            i += 1;
+            continue;
+        }
+
+        // newline shouldn't exist here (your input is line-based), but break if it does
+        if (c == '\n' || c == '\r') break;
+
+        // printable char counts toward wrap width
+        if (is_printable_cell(c)) {
+            if (cells >= width) {
+                // end this segment and start a new one
+                FLUSH_SEG();
+            }
+            APPEND_BYTES(line + i, 1);
+            cells++;
+            i++;
+            continue;
+        }
+
+        // control char: copy but don't count
+        APPEND_BYTES(line + i, 1);
+        i++;
+    }
+
+    // flush last segment
+    if (buf_len > 0 || out.count == 0) {
+        if (out.count >= seg_cap) {
+            char **_ns = (char**)realloc(out.segments, (size_t)(seg_cap + 1) * sizeof(char*));
+            if (!_ns) goto oom;
+            out.segments = _ns;
+        }
+        out.segments[out.count++] = safe_strdup(buf_len ? buf : "");
+    }
+
+    free(buf);
+    return out;
+
+oom:
+    if (buf) free(buf);
+    if (out.segments) {
+        for (int k = 0; k < out.count; k++) free(out.segments[k]);
+        free(out.segments);
+    }
+    return (WrappedLine){0, NULL};
+
+    #undef APPEND_BYTES
+    #undef FLUSH_SEG
+}
 static WrappedLine wrap_line(const char *line, int width) {
     WrappedLine result = (WrappedLine){0, NULL};
     if (!line || width <= 0) return result;
@@ -655,6 +1027,7 @@ static WrappedLine wrap_line(const char *line, int width) {
 
     return result;
 }
+
 static void free_wrapped_line(WrappedLine *wl) {
     if (!wl || !wl->segments) return;
     for (int i = 0; i < wl->count; i++) free(wl->segments[i]);
@@ -807,11 +1180,18 @@ static int buf_ensure_capacity(Buffer *b, int needed) {
     b->line_cap = new_cap;
     return 1;
 }
+
 static void buffer_init_blank(Buffer *b, const char *filepath) {
     memset(b, 0, sizeof(*b));
     b->is_active = 1;
+
     b->line_cap = INITIAL_LINE_CAP;
     b->lines = (char**)calloc((size_t)b->line_cap, sizeof(char*));
+
+    b->raw_cap = INITIAL_LINE_CAP;
+    b->raw_lines = (char**)calloc((size_t)b->raw_cap, sizeof(char*));
+    b->raw_has_ansi = 0;
+
     if (filepath && *filepath) {
         snprintf(b->filepath, sizeof(b->filepath), "%s", filepath);
         b->lang = detect_language(filepath);
@@ -819,27 +1199,47 @@ static void buffer_init_blank(Buffer *b, const char *filepath) {
         b->filepath[0] = '\0';
         b->lang = LANG_NONE;
     }
+
     b->line_count = 1;
     b->lines[0] = safe_strdup("");
+
+    b->raw_lines[0] = safe_strdup("");
     b->scroll_offset = 0;
     b->dirty = 0;
+
     b->undo = NULL; b->undo_len = 0; b->undo_cap = 0;
     b->redo = NULL; b->redo_len = 0; b->redo_cap = 0;
 }
 
 static void free_buffer(Buffer *b) {
     if (!b) return;
+
     for (int i = 0; i < b->line_count; i++) {
         free(b->lines[i]);
         b->lines[i] = NULL;
     }
     free(b->lines);
     b->lines = NULL;
+
+    if (b->raw_lines) {
+        for (int i = 0; i < b->line_count; i++) {
+            free(b->raw_lines[i]);
+            b->raw_lines[i] = NULL;
+        }
+        free(b->raw_lines);
+        b->raw_lines = NULL;
+    }
+
     b->line_count = 0;
     b->line_cap = 0;
+    b->raw_cap = 0;
+    b->raw_has_ansi = 0;
+
     b->is_active = 0;
+
     for (int i = 0; i < b->undo_len; i++) free(b->undo[i]);
     free(b->undo); b->undo = NULL; b->undo_len = 0; b->undo_cap = 0;
+
     for (int i = 0; i < b->redo_len; i++) free(b->redo[i]);
     free(b->redo); b->redo = NULL; b->redo_len = 0; b->redo_cap = 0;
 }
@@ -877,6 +1277,12 @@ static void do_undo(ViewerState *st) {
     buffer_deserialize(b, snap);
     free(snap);
     b->dirty = 1;
+    /* After undo, raw_lines are stale; sync them from plain lines */
+    for (int i = 0; i < b->line_count; i++) {
+        free(b->raw_lines[i]);
+        b->raw_lines[i] = safe_strdup(b->lines[i]);
+    }
+    b->raw_has_ansi = 0;
 }
 
 static void do_redo(ViewerState *st) {
@@ -896,8 +1302,136 @@ static void do_redo(ViewerState *st) {
     buffer_deserialize(b, snap);
     free(snap);
     b->dirty = 1;
+    /* After redo, raw_lines are stale; sync them from plain lines */
+    for (int i = 0; i < b->line_count; i++) {
+        free(b->raw_lines[i]);
+        b->raw_lines[i] = safe_strdup(b->lines[i]);
+    }
+    b->raw_has_ansi = 0;
 }
 
+/* Replace raw_lines[] with syntax-highlighted output from the external
+ * `highlight` binary.  Lines[] (plain text) is never touched here.
+ * Returns 0 on success, -1 if highlight is unavailable or line counts
+ * diverge (caller keeps plain raw_lines as fallback). */
+static int load_raw_via_highlight(Buffer *b, const char *filepath) {
+    if (!b) return -1;
+    if (!check_command_exists("highlight")) return -1;
+    if (!filepath || !filepath[0]) return -1;
+    if (strcmp(filepath, "<stdin>") == 0) return -1;
+
+    char qpath[4096];
+    shell_quote_single(qpath, sizeof(qpath), filepath);
+
+    char cmd[8192];
+    const char *lang = (b->lang != LANG_NONE) ? highlight_lang(b->lang) : NULL;
+
+    /*
+     * Always provide --path when we can; it helps your tool autodetect extension
+     * and also gives it context even if stdin is used.
+     */
+    if (lang && *lang) {
+        snprintf(cmd, sizeof(cmd),
+                 "highlight --force-color --lang %s --path %s < %s 2>/dev/null",
+                 lang, qpath, qpath);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "highlight --force-color --path %s < %s 2>/dev/null",
+                 qpath, qpath);
+    }
+
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+
+    /*
+     * Collect highlighted output lines. Do NOT rtrim() them; preserve whitespace.
+     * We only strip newline terminators (\n/\r\n).
+     */
+    int cap = (b->line_count > 0 ? b->line_count : 1) + 8;
+    char **tmp = (char**)calloc((size_t)cap, sizeof(char*));
+    if (!tmp) { pclose(p); return -1; }
+
+    int count = 0;
+    int has_ansi = 0;
+
+    /* NOTE: MAX_LINE_LEN truncates; that's fine—editor lines are capped anyway. */
+    char line[MAX_LINE_LEN];
+
+    while (fgets(line, sizeof(line), p)) {
+        size_t len = strlen(line);
+
+        /* strip newline(s) only */
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+
+        if (count >= cap) {
+            int new_cap = cap * 2;
+            char **nt = (char**)realloc(tmp, (size_t)new_cap * sizeof(char*));
+            if (!nt) {
+                for (int i = 0; i < count; i++) free(tmp[i]);
+                free(tmp);
+                pclose(p);
+                return -1;
+            }
+            /* ensure new slots are zeroed */
+            memset(nt + cap, 0, (size_t)(new_cap - cap) * sizeof(char*));
+            tmp = nt;
+            cap = new_cap;
+        }
+
+        tmp[count] = safe_strdup(line);
+        if (!has_ansi && line_has_ansi_esc(tmp[count])) has_ansi = 1;
+        count++;
+    }
+
+    int rc = pclose(p);
+
+    /* If the command failed and produced no output, treat as failure. */
+    if (count == 0 && rc != 0) {
+        free(tmp);
+        return -1;
+    }
+
+    /* Ensure raw capacity for at least b->line_count (we'll map partial). */
+    if (!buf_ensure_raw_capacity(b, b->line_count)) {
+        for (int i = 0; i < count; i++) free(tmp[i]);
+        free(tmp);
+        return -1;
+    }
+
+    /*
+     * Commit (partial): replace as many lines as we have.
+     * If highlight returns fewer lines than the buffer, keep existing raw_lines
+     * for the remainder (or you can set them to NULL; renderer should fall back).
+     */
+    int n = count;
+    if (n > b->line_count) n = b->line_count;
+
+    for (int i = 0; i < n; i++) {
+        free(b->raw_lines[i]);
+        b->raw_lines[i] = tmp[i];
+        tmp[i] = NULL;
+    }
+
+    /* Free any extra highlighted lines we didn’t use. */
+    for (int i = n; i < count; i++) {
+        free(tmp[i]);
+        tmp[i] = NULL;
+    }
+    free(tmp);
+
+    /*
+     * If we saw ANSI anywhere, enable ANSI rendering. This is the key switch
+     * that prevents falling back to curses highlighting.
+     */
+    b->raw_has_ansi = has_ansi ? 1 : 0;
+
+    /* Success if we mapped at least one line OR highlight exited cleanly. */
+    if (n > 0) return 0;
+    if (rc == 0) return 0;
+    return -1;
+}
 static int load_file(Buffer *b, const char *filepath) {
     if (!file_exists(filepath)) {
         buffer_init_blank(b, filepath);
@@ -911,8 +1445,14 @@ static int load_file(Buffer *b, const char *filepath) {
     memset(b, 0, sizeof(*b));
     b->is_active = 1;
     b->scroll_offset = 0;
+
     b->line_cap = INITIAL_LINE_CAP;
     b->lines = (char**)calloc((size_t)b->line_cap, sizeof(char*));
+
+    b->raw_cap = INITIAL_LINE_CAP;
+    b->raw_lines = (char**)calloc((size_t)b->raw_cap, sizeof(char*));
+    b->raw_has_ansi = 0;
+
     snprintf(b->filepath, sizeof(b->filepath), "%s", filepath);
     b->lang = detect_language(filepath);
     b->dirty = 0;
@@ -920,17 +1460,34 @@ static int load_file(Buffer *b, const char *filepath) {
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), f)) {
         if (!buf_ensure_capacity(b, b->line_count + 1)) break;
+        if (!buf_ensure_raw_capacity(b, b->line_count + 1)) break;
+
         line[strcspn(line, "\n")] = 0;
         strip_overstrikes(line);
-        strip_ansi(line);
         rtrim(line);
-        b->lines[b->line_count++] = safe_strdup(line);
+
+        /* plain for editing/search */
+        char *plain = safe_strdup(line);
+        strip_ansi(plain);
+        rtrim(plain);
+
+        /* raw starts as plain; may be replaced by highlight below */
+        b->raw_lines[b->line_count] = safe_strdup(plain);
+        b->lines[b->line_count] = plain;
+        b->line_count++;
     }
     fclose(f);
 
     if (b->line_count == 0) {
         b->line_count = 1;
         b->lines[0] = safe_strdup("");
+        b->raw_lines[0] = safe_strdup("");
+    }
+
+    /* Try to replace raw_lines with externally highlighted version */
+    if (b->lang != LANG_NONE) {
+        load_raw_via_highlight(b, filepath);
+        /* On failure, raw_lines already holds plain copies — safe to continue */
     }
 
     b->undo_len = 0;
@@ -941,8 +1498,14 @@ static int load_file(Buffer *b, const char *filepath) {
 static int load_stdin(Buffer *b) {
     memset(b, 0, sizeof(*b));
     b->is_active = 1;
+
     b->line_cap = INITIAL_LINE_CAP;
     b->lines = (char**)calloc((size_t)b->line_cap, sizeof(char*));
+
+    b->raw_cap = INITIAL_LINE_CAP;
+    b->raw_lines = (char**)calloc((size_t)b->raw_cap, sizeof(char*));
+    b->raw_has_ansi = 0;
+
     snprintf(b->filepath, sizeof(b->filepath), "%s", "<stdin>");
     b->lang = LANG_NONE;
     b->scroll_offset = 0;
@@ -951,13 +1514,26 @@ static int load_stdin(Buffer *b) {
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), stdin)) {
         if (!buf_ensure_capacity(b, b->line_count + 1)) break;
+        if (!buf_ensure_raw_capacity(b, b->line_count + 1)) break;
+
         size_t len = strlen(line);
         while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+
         strip_overstrikes(line);
-        strip_ansi(line);
         rtrim(line);
-        b->lines[b->line_count++] = safe_strdup(line);
+
+        char *raw = safe_strdup(line);
+        if (line_has_ansi_esc(raw)) b->raw_has_ansi = 1;
+
+        char *plain = safe_strdup(raw);
+        strip_ansi(plain);
+        rtrim(plain);
+
+        b->raw_lines[b->line_count] = raw;
+        b->lines[b->line_count] = plain;
+        b->line_count++;
     }
+
     if (b->line_count == 0) return -1;
 
     b->undo_len = 0;
@@ -981,6 +1557,7 @@ static char *buffer_serialize(const Buffer *b) {
     *wp = '\0';
     return out;
 }
+
 static void buffer_deserialize(Buffer *b, const char *text) {
     if (!b) return;
     for (int i = 0; i < b->line_count; i++) { free(b->lines[i]); b->lines[i] = NULL; }
@@ -1012,6 +1589,22 @@ static void buffer_deserialize(Buffer *b, const char *text) {
             b->lines[0] = safe_strdup("");
         }
     }
+
+    /* Sync raw_lines to match new line_count — plain copies for now */
+    if (b->raw_lines) {
+        /* free old raw entries beyond new line_count */
+        /* We don't track the old raw count separately; just rebuild from
+         * lines[] which is now set by this function. */
+    }
+    /* Ensure raw capacity matches */
+    if (buf_ensure_raw_capacity(b, b->line_count)) {
+        /* Free and rebuild */
+        for (int i = 0; i < b->line_count; i++) {
+            free(b->raw_lines[i]);
+            b->raw_lines[i] = safe_strdup(b->lines[i]);
+        }
+    }
+    b->raw_has_ansi = 0;
 }
 
 static void clipboard_copy_text(const char *text) {
@@ -1044,8 +1637,6 @@ static char *clipboard_paste_text(void) {
     buf[len] = '\0';
     int pclose_rc = pclose(pipe);
 
-    /* If the clipboard tool exited nonzero AND gave us nothing, treat it as
-     * unavailable (xclip/pbpaste not installed) rather than an empty clipboard. */
     if (pclose_rc != 0 && len == 0) {
         free(buf);
         return NULL;
@@ -1345,6 +1936,13 @@ static void insert_char_at(Buffer *b, int line, int col, char c) {
 
     free(b->lines[line]);
     b->lines[line] = ns;
+
+    /* Keep raw_line in sync with plain text while editing.
+     * We don't re-highlight on every keystroke — raw becomes plain. */
+    free(b->raw_lines[line]);
+    b->raw_lines[line] = safe_strdup(ns);
+    b->raw_has_ansi = 0;
+
     b->dirty = 1;
 }
 
@@ -1361,6 +1959,8 @@ static void delete_char_before(Buffer *b, int *line_io, int *col_io) {
         memcpy(ns + (col - 1), s + col, (size_t)(len - col + 1));
         free(b->lines[line]);
         b->lines[line] = ns;
+        free(b->raw_lines[line]);
+        b->raw_lines[line] = safe_strdup(ns);
         *col_io = col - 1;
         b->dirty = 1;
         return;
@@ -1376,14 +1976,23 @@ static void delete_char_before(Buffer *b, int *line_io, int *col_io) {
 
     free(b->lines[line - 1]);
     b->lines[line - 1] = joined;
-    free(b->lines[line]);
+    free(b->raw_lines[line - 1]);
+    b->raw_lines[line - 1] = safe_strdup(joined);
 
-    for (int i = line; i < b->line_count - 1; i++) b->lines[i] = b->lines[i + 1];
+    free(b->lines[line]);
+    free(b->raw_lines[line]);
+
+    for (int i = line; i < b->line_count - 1; i++) {
+        b->lines[i] = b->lines[i + 1];
+        b->raw_lines[i] = b->raw_lines[i + 1];
+    }
     b->lines[b->line_count - 1] = NULL;
+    b->raw_lines[b->line_count - 1] = NULL;
     b->line_count--;
 
     *line_io = line - 1;
     *col_io = plen;
+    b->raw_has_ansi = 0;
     b->dirty = 1;
 }
 
@@ -1393,6 +2002,7 @@ static void insert_newline(Buffer *b, int *line_io, int *col_io) {
     if (line < 0 || line >= b->line_count) return;
 
     if (!buf_ensure_capacity(b, b->line_count + 1)) return;
+    if (!buf_ensure_raw_capacity(b, b->line_count + 1)) return;
 
     char *s = b->lines[line];
     int len = (int)strlen(s);
@@ -1406,11 +2016,18 @@ static void insert_newline(Buffer *b, int *line_io, int *col_io) {
 
     free(b->lines[line]);
     b->lines[line] = left;
+    free(b->raw_lines[line]);
+    b->raw_lines[line] = safe_strdup(left);
 
-    for (int i = b->line_count; i > line + 1; i--) b->lines[i] = b->lines[i - 1];
+    for (int i = b->line_count; i > line + 1; i--) {
+        b->lines[i] = b->lines[i - 1];
+        b->raw_lines[i] = b->raw_lines[i - 1];
+    }
     b->lines[line + 1] = right;
+    b->raw_lines[line + 1] = safe_strdup(right);
     b->line_count++;
 
+    b->raw_has_ansi = 0;
     *line_io = line + 1;
     *col_io = 0;
     b->dirty = 1;
@@ -1490,6 +2107,7 @@ static void yank_range_to_match(ViewerState *st, int aL, int aC, int bL, int bC)
     clipboard_copy_text(tmp);
     free(tmp);
 }
+
 static void delete_range_to_match(ViewerState *st, int aL, int aC, int bL, int bC, int also_yank) {
     Buffer *b = &st->buffers[st->current_buffer];
     int sL=aL, sC=aC, eL=bL, eC=bC;
@@ -1542,6 +2160,8 @@ static void delete_range_to_match(ViewerState *st, int aL, int aC, int bL, int b
             memcpy(nl + sC, line + eC + 1, (size_t)(line_len - (eC + 1) + 1));
             free(b->lines[sL]);
             b->lines[sL] = nl;
+            free(b->raw_lines[sL]);
+            b->raw_lines[sL] = safe_strdup(nl);
         }
         st->cursor_line = sL;
         st->cursor_col = sC;
@@ -1566,16 +2186,26 @@ static void delete_range_to_match(ViewerState *st, int aL, int aC, int bL, int b
     memcpy(joined, prefix, (size_t)prefix_len);
     memcpy(joined + prefix_len, suffix, (size_t)suffix_len);
     joined[prefix_len + suffix_len] = '\0';
-    for (int L = sL; L <= eL; L++) free(b->lines[L]);
+    for (int L = sL; L <= eL; L++) {
+        free(b->lines[L]);
+        free(b->raw_lines[L]);
+    }
     int dst = sL + 1;
     int src = eL + 1;
     while (src < b->line_count) {
-        b->lines[dst++] = b->lines[src++];
+        b->lines[dst] = b->lines[src];
+        b->raw_lines[dst] = b->raw_lines[src];
+        dst++; src++;
     }
     b->lines[sL] = joined;
+    b->raw_lines[sL] = safe_strdup(joined);
     int new_count = dst;
-    for (int i = new_count; i < b->line_count; i++) b->lines[i] = NULL;
+    for (int i = new_count; i < b->line_count; i++) {
+        b->lines[i] = NULL;
+        b->raw_lines[i] = NULL;
+    }
     b->line_count = new_count;
+    b->raw_has_ansi = 0;
     st->cursor_line = sL;
     st->cursor_col = sC;
     ensure_cursor_bounds(st);
@@ -1605,18 +2235,25 @@ static char *delete_visual_lines(ViewerState *st) {
     for (int i = lo; i <= hi; i++) {
         free(b->lines[i]);
         b->lines[i] = NULL;
+        free(b->raw_lines[i]);
+        b->raw_lines[i] = NULL;
     }
 
     int deleted = hi - lo + 1;
-    for (int i = lo; i < b->line_count - deleted; i++)
+    for (int i = lo; i < b->line_count - deleted; i++) {
         b->lines[i] = b->lines[i + deleted];
-    for (int i = b->line_count - deleted; i < b->line_count; i++)
+        b->raw_lines[i] = b->raw_lines[i + deleted];
+    }
+    for (int i = b->line_count - deleted; i < b->line_count; i++) {
         b->lines[i] = NULL;
+        b->raw_lines[i] = NULL;
+    }
     b->line_count -= deleted;
 
     if (b->line_count == 0) {
         b->line_count = 1;
         b->lines[0] = safe_strdup("");
+        b->raw_lines[0] = safe_strdup("");
     }
 
     b->dirty = 1;
@@ -1642,9 +2279,14 @@ static void delete_all_lines(ViewerState *st) {
     char *snap = buffer_serialize(b);
     if (snap) { clipboard_copy_text(snap); free(snap); }
     undo_push(b);
-    for (int i = 0; i < b->line_count; i++) { free(b->lines[i]); b->lines[i] = NULL; }
+    for (int i = 0; i < b->line_count; i++) {
+        free(b->lines[i]);    b->lines[i] = NULL;
+        free(b->raw_lines[i]); b->raw_lines[i] = NULL;
+    }
     b->line_count = 1;
     b->lines[0] = safe_strdup("");
+    b->raw_lines[0] = safe_strdup("");
+    b->raw_has_ansi = 0;
     b->dirty = 1;
     st->cursor_line = 0;
     st->cursor_col  = 0;
@@ -1704,6 +2346,7 @@ static int add_buffer_from_path(ViewerState *st, const char *path) {
     set_status(st, "Added buffer");
     return 0;
 }
+
 static void shell_quote_single(char *out, size_t out_len, const char *in) {
     if (!out || out_len == 0) return;
 
@@ -1743,11 +2386,11 @@ static void shell_quote_single(char *out, size_t out_len, const char *in) {
     out[j++] = '\'';
     out[j] = '\0';
 }
+
 static int in_tmux(void) {
     const char *t = getenv("TMUX");
     return (t && *t);
 }
-
 
 static int tmux_pane_alive(const char *pane_id) {
     if (!pane_id || !*pane_id) return 0;
@@ -1799,6 +2442,7 @@ static int tmux_create_bottom_terminal(const char *cwd, char *out_pane, size_t o
     system("tmux last-pane 2>/dev/null");
     return 0;
 }
+
 static void buffer_cwd(const Buffer *b, char *out, size_t out_len) {
     if (!out || out_len == 0) return;
     out[0] = '\0';
@@ -1816,8 +2460,8 @@ static void buffer_cwd(const Buffer *b, char *out, size_t out_len) {
 
     if (getcwd(out, out_len) == NULL) snprintf(out, out_len, ".");
 }
-static char g_terminal_pane_id[128] = {0};
 
+static char g_terminal_pane_id[128] = {0};
 
 static void chomp(char *s) {
     if (!s) return;
@@ -1861,6 +2505,7 @@ static void tmux_unset_window_opt(const char *opt) {
     snprintf(cmd, sizeof(cmd), "tmux unset-option -w %s 2>/dev/null", opt);
     system(cmd);
 }
+
 void tmux_toggle_lldb(const char *cwd) {
     if (!getenv("TMUX")) return;
     char pane[64] = {0};
@@ -1904,6 +2549,7 @@ void tmux_toggle_lldb(const char *cwd) {
         system("tmux last-pane 2>/dev/null");
     }
 }
+
 void tmux_toggle_db(const char *cwd) {
     if (!getenv("TMUX")) return;
     char pane[64] = {0};
@@ -1948,6 +2594,7 @@ void tmux_toggle_db(const char *cwd) {
         system("tmux last-pane 2>/dev/null");
     }
 }
+
 void tmux_toggle_peek(const char *cwd) {
     if (!getenv("TMUX")) return;
 
@@ -2050,6 +2697,7 @@ void tmux_toggle_peek(const char *cwd) {
 
     system("tmux last-pane 2>/dev/null");
 }
+
 void tmux_toggle_terminal(const char *cwd) {
     if (!getenv("TMUX")) return;
 
@@ -2150,8 +2798,6 @@ static void cmd_list_buffers(ViewerState *st) {
         set_status(st, "Failed to create result file");
         return;
     }
-    /* Do NOT close result_fd - keep it open so we read back through our own fd
-     * after fzf writes, eliminating the TOCTOU window. */
 
     char cmd[8192];
     if (have_nfzf) {
@@ -2182,7 +2828,6 @@ static void cmd_list_buffers(ViewerState *st) {
         return;
     }
 
-    /* Seek back to start and read through our own fd - no re-open by name */
     if (lseek(result_fd, 0, SEEK_SET) < 0) {
         close(result_fd);
         unlink(result_template);
@@ -2205,7 +2850,7 @@ static void cmd_list_buffers(ViewerState *st) {
         temp_forget_path(result_template);
         return;
     }
-    fclose(result_file); /* also closes result_fd */
+    fclose(result_file);
     unlink(result_template);
     temp_forget_path(result_template);
 
@@ -2252,6 +2897,10 @@ static void cmd_write(ViewerState *st, const char *arg) {
             b->lang = detect_language(b->filepath);
         }
         b->dirty = 0;
+        /* Re-highlight after write so raw_lines get fresh ANSI */
+        if (b->lang != LANG_NONE) {
+            load_raw_via_highlight(b, b->filepath);
+        }
         set_status(st, "Wrote file");
     } else {
         char msg[256];
@@ -2375,6 +3024,12 @@ static void draw_buffer(ViewerState *st) {
     const int start_x       = line_nr_width + 1;
     const int do_search_hl  = (st->search_highlight && st->search_term[0] != '\0');
 
+    /* Use external ANSI highlighting only when wrap is OFF.
+     * When wrap is ON we use plain lines because wrap_line() splits on byte
+     * boundaries and would corrupt mid-sequence escape codes.  The internal
+     * highlight_line() fallback still provides decent colouring in that case. */
+    const int use_ansi = b->raw_has_ansi;
+
     for (int y = 0; y < h; y++) {
         move(y, 0);
         clrtoeol();
@@ -2402,13 +3057,23 @@ static void draw_buffer(ViewerState *st) {
             const int in_sel = (st->mode == MODE_VISUAL && line_idx >= sel_lo && line_idx <= sel_hi);
 
             if (in_sel) attron(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
-            highlight_line(b->lines[line_idx], b->lang, y, start_x, max_x,
-                           st->search_term, do_search_hl);
+
+            if (use_ansi && b->raw_lines && b->raw_lines[line_idx]) {
+                draw_ansi_line(b->raw_lines[line_idx], y, start_x, max_x);
+            } else {
+                highlight_line(b->lines[line_idx], b->lang, y, start_x, max_x,
+                               st->search_term, do_search_hl);
+            }
+
             if (in_sel) attroff(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
         }
         return;
     }
 
+    /* Wrapped rendering.
+     * We wrap using plain b->lines[] (safe byte boundaries for geometry).
+     * If ANSI is available, we render b->raw_lines[] segments via draw_ansi_line;
+     * otherwise fall back to internal highlight_line(). */
     const int text_w = text_width_for(st);
 
     int y = 0;
@@ -2416,8 +3081,13 @@ static void draw_buffer(ViewerState *st) {
     if (logical < 0) logical = 0;
 
     while (y < h && logical < b->line_count) {
+        /* Always wrap the plain line for correct geometry */
         WrappedLine wl = wrap_line(b->lines[logical], text_w);
 
+WrappedLine wl_raw = (WrappedLine){0, NULL};
+if (use_ansi && b->raw_lines && b->raw_lines[logical]) {
+    wl_raw = ansi_wrap_line(b->raw_lines[logical], text_w);
+}
         const int in_sel = (st->mode == MODE_VISUAL && logical >= sel_lo && logical <= sel_hi);
 
         for (int seg = 0; seg < wl.count && y < h; seg++) {
@@ -2432,17 +3102,23 @@ static void draw_buffer(ViewerState *st) {
             }
 
             if (in_sel) attron(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
-            highlight_line(wl.segments[seg], b->lang, y, start_x, max_x,
-                           st->search_term, do_search_hl);
+            if (use_ansi && wl_raw.segments && seg < wl_raw.count) {
+                draw_ansi_line(wl_raw.segments[seg], y, start_x, max_x);
+            } else {
+                highlight_line(wl.segments[seg], b->lang, y, start_x, max_x,
+                               st->search_term, do_search_hl);
+            }
             if (in_sel) attroff(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
 
             y++;
         }
 
         free_wrapped_line(&wl);
+        if (wl_raw.segments) free_wrapped_line(&wl_raw);
         logical++;
     }
 }
+
 static void cursor_to_screen(ViewerState *st, int *out_y, int *out_x) {
     Buffer *b = &st->buffers[st->current_buffer];
     int max_x = getmaxx(stdscr);
@@ -2587,85 +3263,87 @@ static void exec_command(ViewerState *st, const char *cmd, int *running) {
     }
     if (strcmp(tok, "?") == 0) { cmd_show_help(st); return; }
     if (strcmp(tok, "qa!") == 0 || strcmp(tok, "qall!") == 0) { *running = 0; return; }
+
     /* :s/pattern/replacement/  or  :s/pattern/replacement/g */
-if (tok[0] == 's' && tok[1] == '\0') {
-    if (!p || !*p) { set_status(st, "Usage: :s /pat/repl/ or :s /pat/repl/g"); return; }
-    char delim = p[0];
-    const char *seg1 = p + 1;
-    const char *seg2 = strchr(seg1, delim);
-    if (!seg2) { set_status(st, "Bad substitution syntax"); return; }
-    char pattern[256] = {0};
-    int plen = (int)(seg2 - seg1);
-    if (plen <= 0) { set_status(st, "Empty pattern"); return; }
-    if (plen >= (int)sizeof(pattern)) { set_status(st, "Pattern too long"); return; }
-    memcpy(pattern, seg1, (size_t)plen);
+    if (tok[0] == 's' && tok[1] == '\0') {
+        if (!p || !*p) { set_status(st, "Usage: :s /pat/repl/ or :s /pat/repl/g"); return; }
+        char delim = p[0];
+        const char *seg1 = p + 1;
+        const char *seg2 = strchr(seg1, delim);
+        if (!seg2) { set_status(st, "Bad substitution syntax"); return; }
+        char pattern[256] = {0};
+        int plen = (int)(seg2 - seg1);
+        if (plen <= 0) { set_status(st, "Empty pattern"); return; }
+        if (plen >= (int)sizeof(pattern)) { set_status(st, "Pattern too long"); return; }
+        memcpy(pattern, seg1, (size_t)plen);
 
-    const char *seg3 = seg2 + 1;
-    const char *seg4 = strchr(seg3, delim);
-    char replacement[256] = {0};
-    int rlen = seg4 ? (int)(seg4 - seg3) : (int)strlen(seg3);
-    if (rlen >= (int)sizeof(replacement)) { set_status(st, "Replacement too long"); return; }
-    if (rlen > 0) memcpy(replacement, seg3, (size_t)rlen);
+        const char *seg3 = seg2 + 1;
+        const char *seg4 = strchr(seg3, delim);
+        char replacement[256] = {0};
+        int rlen = seg4 ? (int)(seg4 - seg3) : (int)strlen(seg3);
+        if (rlen >= (int)sizeof(replacement)) { set_status(st, "Replacement too long"); return; }
+        if (rlen > 0) memcpy(replacement, seg3, (size_t)rlen);
 
-    /* flags: g = replace all occurrences per line (default: first only) */
-    int global = 0;
-    if (seg4) {
-        const char *flags = seg4 + 1;
-        while (*flags) { if (*flags == 'g') global = 1; flags++; }
-    }
-
-    undo_push(b);
-    int total = 0;
-    int patlen = plen;
-    int replen = rlen;
-
-    for (int li = 0; li < b->line_count; li++) {
-        char *line = b->lines[li];
-        /* count occurrences to size the output buffer */
-        int occurrences = 0;
-        const char *scan = line;
-        while ((scan = strstr(scan, pattern))) { occurrences++; scan += patlen; }
-        if (occurrences == 0) continue;
-        if (!global) occurrences = 1;
-
-        int orig_len = (int)strlen(line);
-        int new_len = orig_len + occurrences * (replen - patlen);
-        if (new_len < 0) new_len = 0;
-        char *out = (char*)malloc((size_t)new_len + 1);
-        if (!out) { set_status(st, "Out of memory"); return; }
-
-        char *wp = out;
-        const char *rp = line;
-        int replaced = 0;
-        while (*rp) {
-            if ((!global || 1) && (global ? 1 : replaced < 1) &&
-                strncmp(rp, pattern, (size_t)patlen) == 0 &&
-                (global || replaced == 0)) {
-                memcpy(wp, replacement, (size_t)replen);
-                wp += replen;
-                rp += patlen;
-                replaced++;
-                total++;
-            } else {
-                *wp++ = *rp++;
-            }
+        int global = 0;
+        if (seg4) {
+            const char *flags = seg4 + 1;
+            while (*flags) { if (*flags == 'g') global = 1; flags++; }
         }
-        *wp = '\0';
 
-        free(b->lines[li]);
-        b->lines[li] = out;
+        undo_push(b);
+        int total = 0;
+        int patlen = plen;
+        int replen = rlen;
+
+        for (int li = 0; li < b->line_count; li++) {
+            char *line = b->lines[li];
+            int occurrences = 0;
+            const char *scan = line;
+            while ((scan = strstr(scan, pattern))) { occurrences++; scan += patlen; }
+            if (occurrences == 0) continue;
+            if (!global) occurrences = 1;
+
+            int orig_len = (int)strlen(line);
+            int new_len = orig_len + occurrences * (replen - patlen);
+            if (new_len < 0) new_len = 0;
+            char *out = (char*)malloc((size_t)new_len + 1);
+            if (!out) { set_status(st, "Out of memory"); return; }
+
+            char *wp = out;
+            const char *rp = line;
+            int replaced = 0;
+            while (*rp) {
+                if (strncmp(rp, pattern, (size_t)patlen) == 0 && (global || replaced == 0)) {
+                    memcpy(wp, replacement, (size_t)replen);
+                    wp += replen;
+                    rp += patlen;
+                    replaced++;
+                    total++;
+                } else {
+                    *wp++ = *rp++;
+                }
+            }
+            *wp = '\0';
+
+            free(b->lines[li]);
+            b->lines[li] = out;
+            free(b->raw_lines[li]);
+            b->raw_lines[li] = safe_strdup(out);
+        }
+
+        b->raw_has_ansi = 0;
+
+        if (total == 0) {
+            set_status(st, "No matches");
+        } else {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Replaced %d occurrence%s", total, total == 1 ? "" : "s");
+            set_status(st, msg);
+        }
+        b->dirty = 1;
+        return;
     }
 
-    if (total == 0) {
-        set_status(st, "No matches");
-    } else {
-        char msg[128];
-        snprintf(msg, sizeof(msg), "Replaced %d occurrence%s", total, total == 1 ? "" : "s");
-        set_status(st, msg);
-    }
-    b->dirty = 1;
-    return;
-}
     if (strcmp(tok, "q") == 0) {
         Buffer *cur = &st->buffers[st->current_buffer];
         if (!cur->dirty) { close_current_buffer(st); return; }
@@ -2919,12 +3597,14 @@ static void prompt_search(ViewerState *st) {
     find_all_matches(st);
     jump_to_first_match(st);
 }
+
 static inline void insert_undo_maybe_push(ViewerState *st, Buffer *b) {
     if (!st->insert_undo_armed) {
         undo_push(b);
         st->insert_undo_armed = 1;
     }
 }
+
 static void handle_input(ViewerState *st, int *running) {
     int ch = getch();
 
@@ -3064,14 +3744,18 @@ static void handle_input(ViewerState *st, int *running) {
             clipboard_copy_text(b->lines[st->cursor_line]);
             undo_push(b);
             free(b->lines[st->cursor_line]);
+            free(b->raw_lines[st->cursor_line]);
             for (int i = st->cursor_line; i < b->line_count - 1; i++) {
                 b->lines[i] = b->lines[i + 1];
+                b->raw_lines[i] = b->raw_lines[i + 1];
             }
             b->lines[b->line_count - 1] = NULL;
+            b->raw_lines[b->line_count - 1] = NULL;
             b->line_count--;
             if (b->line_count <= 0) {
                 b->line_count = 1;
                 b->lines[0] = safe_strdup("");
+                b->raw_lines[0] = safe_strdup("");
                 st->cursor_line = 0;
             }
             if (st->cursor_line >= b->line_count) {
@@ -3246,28 +3930,14 @@ static void handle_input(ViewerState *st, int *running) {
             return;
         }
         case '%': {
-            /* Check for %y / %d (all-lines ops) first */
             st->percent_pending = 1;
-            /* Also handle as bracket jump if no follow-up recognized */
-            /* We set percent_pending; if the next key isn't y/d,
-               we fall back to a bracket jump in the next handle_input call.
-               But we also do the bracket jump immediately here if we're NOT
-               expecting %y/%d - keep both paths: set the flag AND do the jump
-               so that plain % still works on the same keypress. */
             int toL, toC, fromL, fromC;
             if (jump_percent(st, &toL, &toC, &fromL, &fromC)) {
-                /* Store result; will be used if next key isn't y/d.
-                   For simplicity, just jump immediately and also set pending.
-                   The %y / %d path sets percent_pending before the switch,
-                   so plain % should jump now. */
-                st->percent_pending = 0; /* consume it - plain % jumps now */
+                st->percent_pending = 0;
                 st->cursor_line = toL;
                 st->cursor_col  = toC;
                 ensure_cursor_bounds(st);
                 ensure_cursor_visible(st);
-            } else {
-                /* No bracket - might be %y or %d coming next */
-                /* percent_pending already set above */
             }
             return;
         }
@@ -3275,6 +3945,7 @@ static void handle_input(ViewerState *st, int *running) {
             return;
     }
 }
+
 static void handle_insert_key(ViewerState *st, int ch) {
     Buffer *b = &st->buffers[st->current_buffer];
 
@@ -3315,6 +3986,8 @@ static void handle_insert_key(ViewerState *st, int ch) {
                     ns[len - 1] = '\0';
                     free(b->lines[st->cursor_line]);
                     b->lines[st->cursor_line] = ns;
+                    free(b->raw_lines[st->cursor_line]);
+                    b->raw_lines[st->cursor_line] = safe_strdup(ns);
                     b->dirty = 1;
                 }
             }
@@ -3425,6 +4098,7 @@ static void handle_insert_key(ViewerState *st, int ch) {
         return;
     }
 }
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage:\n"
@@ -3433,6 +4107,7 @@ static void usage(const char *prog) {
         prog, prog
     );
 }
+
 int main(int argc, char *argv[]) {
     setlocale(LC_ALL, "");
 
@@ -3562,7 +4237,7 @@ int main(int argc, char *argv[]) {
     noecho();
     keypad(stdscr, TRUE);
     curs_set(1);
-//    halfdelay(1);
+
     if (has_colors()) {
         start_color();
         use_default_colors();
@@ -3575,6 +4250,9 @@ int main(int argc, char *argv[]) {
         init_pair(COLOR_STATUS,      COLOR_WHITE,  -1);
         init_pair(COLOR_COPY_SELECT, COLOR_WHITE,  COLOR_BLUE);
         init_pair(COLOR_SEARCH_HL,   COLOR_BLACK,  COLOR_YELLOW);
+
+        /* Clear the ANSI dynamic pair table after start_color() */
+        ansi_pairs_reset();
     }
 
     for (int i = 0; i < st->buffer_count; i++) {
