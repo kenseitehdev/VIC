@@ -17,12 +17,24 @@
 #include <stdbool.h>
 
 #define MAX_BUFFERS   20
-// [CHANGE 1] MAX_LINES now controls the initial capacity of the dynamic line
-// pointer array.  The array grows as needed; see buf_ensure_capacity().
 #define INITIAL_LINE_CAP 1024
 #define MAX_LINE_LEN  2048
 
 #define CMDHIST_MAX   25
+
+/* safe_strdup: wraps strdup() and aborts on OOM.
+ * For a terminal editor, out-of-memory is unrecoverable; a clean abort with a
+ * message is better than a NULL-deref crash somewhere later.
+ */
+static char *safe_strdup(const char *s) {
+    char *r = strdup(s);
+    if (!r) {
+        endwin();
+        fprintf(stderr, "vic: out of memory\n");
+        abort();
+    }
+    return r;
+}
 
 typedef enum {
     LANG_NONE = 0,
@@ -38,15 +50,13 @@ typedef struct {
 } WrappedLine;
 
 typedef struct {
-    // [CHANGE 1] lines is now a dynamically-sized heap array; line_cap tracks
-    // the allocated capacity so we can realloc when needed.
     char **lines;
     int line_count;
-    int line_cap;           // allocated slots in lines[]
+    int line_cap;
 
-    char filepath[1024];    // empty => [No Name]
+    char filepath[1024];
     Language lang;
-    int scroll_offset;      // top logical line
+    int scroll_offset;
     int is_active;
     int dirty;
     char **undo;
@@ -111,11 +121,8 @@ typedef struct {
 
     char terminal_pane_id[128];
 
-    // --- needed by your insert-mode undo coalescing ---
     int insert_undo_armed;
 
-    // [CHANGE 4/5] track whether a '%' was typed as a count prefix in normal
-    // mode (i.e. :%y / :%d meaning "all lines").
     int percent_pending;
 } ViewerState;
 
@@ -136,20 +143,19 @@ static Language detect_language(const char *filepath);
 // -----------------------------
 #define VIC_MAX_TEMP 128
 #define VIC_TEMP_PATH_MAX 1024
-// ---- forward declarations (needed in C99/C11) ----
+// ---- forward declarations ----
 static int  check_command_exists(const char *cmd);
 static void temp_register_path(const char *path);
 static void temp_forget_path(const char *path);
 static void shell_quote_single(char *out, size_t out_len, const char *in);
 static void trim_newlines(char *s);
 static char *pick_file_from_dir_raw(const char *dir);
-// (and if you have these too, add them)
 static int  is_dir_path(const char *path);
 static int  load_file(Buffer *buf, const char *path);
 static void usage(const char *argv0);
 static char g_temp_paths[VIC_MAX_TEMP][VIC_TEMP_PATH_MAX];
 static int  g_temp_count = 0;
-static void sh_quote(const char *in, char *out, size_t out_sz);
+
 static volatile sig_atomic_t g_exit_signal = 0;
 static char *buffer_serialize(const Buffer *b);
 static void  buffer_deserialize(Buffer *b, const char *text);
@@ -159,16 +165,10 @@ static int is_dir_path(const char *path) {
     if (stat(path, &st) != 0) return 0;
     return S_ISDIR(st.st_mode);
 }
-// --- fixed: pick_file ---
-// - removes duplicated mkstemp/close
-// - registers temp once, forgets it on every exit path
-// - uses /dev/tty for fzf (so ncurses input works)
-// - cleans up temp file reliably
 static char *pick_file(void) {
     int have_ff  = check_command_exists("ff");
     int have_fzf = check_command_exists("fzf");
 
-    // Manual fallback
     if (!have_ff && !have_fzf) {
         char chosen[2048] = {0};
 
@@ -189,13 +189,14 @@ static char *pick_file(void) {
 
         trim_newlines(chosen);
         if (chosen[0] == '\0') return NULL;
-        return strdup(chosen);
+        return safe_strdup(chosen);
     }
 
     char tmp_template[] = "/tmp/nbl_vic_pick_XXXXXX";
     int fdout = mkstemp(tmp_template);
     if (fdout < 0) return NULL;
-    close(fdout);
+    /* Do NOT close fdout - keep it open so we read back through our own fd
+     * after the shell writes, eliminating the TOCTOU window. */
 
     temp_register_path(tmp_template);
 
@@ -245,13 +246,22 @@ static char *pick_file(void) {
     refresh();
 
     if (rc != 0) {
+        close(fdout);
         unlink(tmp_template);
         temp_forget_path(tmp_template);
         return NULL;
     }
 
-    FILE *f = fopen(tmp_template, "r");
+    /* Seek back to the start and read through our own fd - no re-open by name */
+    if (lseek(fdout, 0, SEEK_SET) < 0) {
+        close(fdout);
+        unlink(tmp_template);
+        temp_forget_path(tmp_template);
+        return NULL;
+    }
+    FILE *f = fdopen(fdout, "r");
     if (!f) {
+        close(fdout);
         unlink(tmp_template);
         temp_forget_path(tmp_template);
         return NULL;
@@ -264,14 +274,14 @@ static char *pick_file(void) {
         temp_forget_path(tmp_template);
         return NULL;
     }
-    fclose(f);
+    fclose(f); /* also closes fdout */
 
     unlink(tmp_template);
     temp_forget_path(tmp_template);
 
     trim_newlines(buf);
     if (buf[0] == '\0') return NULL;
-    return strdup(buf);
+    return safe_strdup(buf);
 }
 static char *pick_file_from_dir_raw(const char *dir) {
     if (!dir || !*dir) dir = ".";
@@ -279,7 +289,6 @@ static char *pick_file_from_dir_raw(const char *dir) {
     int have_fzf = check_command_exists("fzf");
 
     if (!have_ff && !have_fzf) {
-        // manual fallback
         char chosen[2048] = {0};
         def_prog_mode();
         endwin();
@@ -294,22 +303,22 @@ static char *pick_file_from_dir_raw(const char *dir) {
         refresh();
         trim_newlines(chosen);
         if (!chosen[0]) return NULL;
-        return strdup(chosen);
+        return safe_strdup(chosen);
     }
 
     char tmp_template[] = "/tmp/nbl_pick_dir_XXXXXX";
     int fdout = mkstemp(tmp_template);
     if (fdout < 0) return NULL;
-    close(fdout);
+    /* Do NOT close fdout - keep it open so we read back through our own fd
+     * after the shell writes, eliminating the TOCTOU window. */
 
     temp_register_path(tmp_template);
 
     char qdir[4096];
-    sh_quote(dir, qdir, sizeof(qdir));
+    shell_quote_single(qdir, sizeof(qdir), dir);
 
     char cmd[8192];
 
-    // Use fd if available, otherwise find
     int has_fd = check_command_exists("fd");
     if (has_fd) {
         if (have_ff) {
@@ -356,13 +365,22 @@ static char *pick_file_from_dir_raw(const char *dir) {
     refresh();
 
     if (rc != 0) {
+        close(fdout);
         unlink(tmp_template);
         temp_forget_path(tmp_template);
         return NULL;
     }
 
-    FILE *f = fopen(tmp_template, "r");
+    /* Seek back to the start and read through our own fd - no re-open by name */
+    if (lseek(fdout, 0, SEEK_SET) < 0) {
+        close(fdout);
+        unlink(tmp_template);
+        temp_forget_path(tmp_template);
+        return NULL;
+    }
+    FILE *f = fdopen(fdout, "r");
     if (!f) {
+        close(fdout);
         unlink(tmp_template);
         temp_forget_path(tmp_template);
         return NULL;
@@ -375,7 +393,7 @@ static char *pick_file_from_dir_raw(const char *dir) {
         temp_forget_path(tmp_template);
         return NULL;
     }
-    fclose(f);
+    fclose(f); /* also closes fdout */
 
     unlink(tmp_template);
     temp_forget_path(tmp_template);
@@ -383,14 +401,11 @@ static char *pick_file_from_dir_raw(const char *dir) {
     trim_newlines(buf);
     if (!buf[0]) return NULL;
 
-    // IMPORTANT: this returns the selection "as printed" by fd/find.
-    // If you want absolute path, you can join dir + buf here.
-    return strdup(buf);
+    return safe_strdup(buf);
 }
 static void temp_register_path(const char *path) {
     if (!path || !*path) return;
     if (g_temp_count >= VIC_MAX_TEMP) return;
-    // store a copy in a fixed buffer (no malloc -> safe for signal cleanup)
     snprintf(g_temp_paths[g_temp_count], sizeof(g_temp_paths[g_temp_count]), "%s", path);
     g_temp_count++;
 }
@@ -399,7 +414,7 @@ static void temp_forget_path(const char *path) {
     if (!path || !*path) return;
     for (int i = 0; i < g_temp_count; i++) {
         if (g_temp_paths[i][0] && strcmp(g_temp_paths[i], path) == 0) {
-            g_temp_paths[i][0] = '\0'; // tombstone
+            g_temp_paths[i][0] = '\0';
             return;
         }
     }
@@ -408,16 +423,26 @@ static void temp_forget_path(const char *path) {
 static void temp_cleanup_all(void) {
     for (int i = 0; i < g_temp_count; i++) {
         if (g_temp_paths[i][0]) {
-            unlink(g_temp_paths[i]);     // ok if already deleted
+            unlink(g_temp_paths[i]);
             g_temp_paths[i][0] = '\0';
         }
     }
     g_temp_count = 0;
 }
 
-// Signals: set a flag; main loop exits cleanly and runs cleanup/endwin
 static void on_signal_request_exit(int sig) {
     g_exit_signal = sig;
+}
+
+/* Crash handler: clean up temp files, restore terminal, then re-raise so the
+ * default action (core dump, abnormal exit status) still happens.
+ * Async-signal-safe: only calls unlink(), write(), endwin() approximated via
+ * reset, and raise(). stdio/malloc are not used here. */
+static void on_signal_crash(int sig) {
+    temp_cleanup_all();  /* unlink() is async-signal-safe */
+    endwin();            /* best-effort terminal restore */
+    signal(sig, SIG_DFL);
+    raise(sig);
 }
 
 static void install_exit_signal_handlers(void) {
@@ -426,14 +451,26 @@ static void install_exit_signal_handlers(void) {
     sa.sa_handler = on_signal_request_exit;
     sigemptyset(&sa.sa_mask);
 
-    // “normal” termination signals
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGHUP,  &sa, NULL);
     sigaction(SIGQUIT, &sa, NULL);
 
-    // NOTE: we are not doing SIGSEGV here because endwin()/stdio is unsafe there.
-    // atexit cleanup still helps for normal exits; SIG* above covers most interrupts.
+    /* Crash signals: clean temp files and restore terminal before dying.
+     * Re-raise with SIG_DFL so the process still exits with the right status
+     * and core dump behaviour is preserved. */
+    struct sigaction sa_crash;
+    memset(&sa_crash, 0, sizeof(sa_crash));
+    sa_crash.sa_handler = on_signal_crash;
+    sigemptyset(&sa_crash.sa_mask);
+    /* SA_RESETHAND: automatically reset to SIG_DFL after first invocation,
+     * preventing infinite loops if cleanup itself faults. */
+    sa_crash.sa_flags = SA_RESETHAND;
+
+    sigaction(SIGSEGV, &sa_crash, NULL);
+    sigaction(SIGABRT, &sa_crash, NULL);
+    sigaction(SIGBUS,  &sa_crash, NULL);
+    sigaction(SIGFPE,  &sa_crash, NULL);
 }
 static void set_status(ViewerState *st, const char *msg) {
     if (!st) return;
@@ -470,7 +507,6 @@ static int check_command_exists(const char *cmd) {
     return system(test) == 0;
 }
 
-// --- tiny helper to trim newline(s) ---
 static void trim_newlines(char *s) {
     if (!s) return;
     size_t len = strlen(s);
@@ -576,7 +612,6 @@ static WrappedLine wrap_line(const char *line, int width) {
 
     const size_t len = strlen(line);
 
-    // Always return at least 1 segment
     size_t max_segments = (len / (size_t)width) + 2;
     if (max_segments < 1) max_segments = 1;
 
@@ -584,7 +619,7 @@ static WrappedLine wrap_line(const char *line, int width) {
     if (!result.segments) return (WrappedLine){0, NULL};
 
     if (len == 0) {
-        result.segments[0] = strdup("");
+        result.segments[0] = safe_strdup("");
         if (!result.segments[0]) { free(result.segments); return (WrappedLine){0, NULL}; }
         result.count = 1;
         return result;
@@ -593,7 +628,6 @@ static WrappedLine wrap_line(const char *line, int width) {
     size_t pos = 0;
     while (pos < len) {
         if ((size_t)result.count >= max_segments) {
-            // Shouldn't happen with our sizing, but never write past the array.
             break;
         }
 
@@ -602,7 +636,6 @@ static WrappedLine wrap_line(const char *line, int width) {
 
         char *seg = (char*)malloc(take + 1);
         if (!seg) {
-            // fail safely: free what we already allocated
             for (int i = 0; i < result.count; i++) free(result.segments[i]);
             free(result.segments);
             return (WrappedLine){0, NULL};
@@ -614,9 +647,8 @@ static WrappedLine wrap_line(const char *line, int width) {
         pos += take;
     }
 
-    // If we somehow ended up with 0, guarantee one empty segment.
     if (result.count == 0) {
-        result.segments[0] = strdup("");
+        result.segments[0] = safe_strdup("");
         if (!result.segments[0]) { free(result.segments); return (WrappedLine){0, NULL}; }
         result.count = 1;
     }
@@ -765,8 +797,6 @@ static void highlight_line(const char *line, Language lang, int y, int start_x, 
     }
 }
 
-// [CHANGE 1] Ensure the line pointer array has room for at least `needed`
-// entries, growing by doubling if necessary.
 static int buf_ensure_capacity(Buffer *b, int needed) {
     if (needed <= b->line_cap) return 1;
     int new_cap = b->line_cap ? b->line_cap : INITIAL_LINE_CAP;
@@ -790,7 +820,7 @@ static void buffer_init_blank(Buffer *b, const char *filepath) {
         b->lang = LANG_NONE;
     }
     b->line_count = 1;
-    b->lines[0] = strdup("");
+    b->lines[0] = safe_strdup("");
     b->scroll_offset = 0;
     b->dirty = 0;
     b->undo = NULL; b->undo_len = 0; b->undo_cap = 0;
@@ -881,7 +911,6 @@ static int load_file(Buffer *b, const char *filepath) {
     memset(b, 0, sizeof(*b));
     b->is_active = 1;
     b->scroll_offset = 0;
-    // [CHANGE 1] start with initial capacity; grows as needed
     b->line_cap = INITIAL_LINE_CAP;
     b->lines = (char**)calloc((size_t)b->line_cap, sizeof(char*));
     snprintf(b->filepath, sizeof(b->filepath), "%s", filepath);
@@ -890,19 +919,18 @@ static int load_file(Buffer *b, const char *filepath) {
 
     char line[MAX_LINE_LEN];
     while (fgets(line, sizeof(line), f)) {
-        // [CHANGE 1] grow the array instead of silently stopping
         if (!buf_ensure_capacity(b, b->line_count + 1)) break;
         line[strcspn(line, "\n")] = 0;
         strip_overstrikes(line);
         strip_ansi(line);
         rtrim(line);
-        b->lines[b->line_count++] = strdup(line);
+        b->lines[b->line_count++] = safe_strdup(line);
     }
     fclose(f);
 
     if (b->line_count == 0) {
         b->line_count = 1;
-        b->lines[0] = strdup("");
+        b->lines[0] = safe_strdup("");
     }
 
     b->undo_len = 0;
@@ -913,7 +941,6 @@ static int load_file(Buffer *b, const char *filepath) {
 static int load_stdin(Buffer *b) {
     memset(b, 0, sizeof(*b));
     b->is_active = 1;
-    // [CHANGE 1] dynamic array
     b->line_cap = INITIAL_LINE_CAP;
     b->lines = (char**)calloc((size_t)b->line_cap, sizeof(char*));
     snprintf(b->filepath, sizeof(b->filepath), "%s", "<stdin>");
@@ -929,7 +956,7 @@ static int load_stdin(Buffer *b) {
         strip_overstrikes(line);
         strip_ansi(line);
         rtrim(line);
-        b->lines[b->line_count++] = strdup(line);
+        b->lines[b->line_count++] = safe_strdup(line);
     }
     if (b->line_count == 0) return -1;
 
@@ -939,7 +966,7 @@ static int load_stdin(Buffer *b) {
 }
 
 static char *buffer_serialize(const Buffer *b) {
-    if (!b || b->line_count <= 0) return strdup("");
+    if (!b || b->line_count <= 0) return safe_strdup("");
     size_t total = 0;
     for (int i = 0; i < b->line_count; i++) total += strlen(b->lines[i]) + 1;
     char *out = (char*)malloc(total + 1);
@@ -962,7 +989,7 @@ static void buffer_deserialize(Buffer *b, const char *text) {
     if (!text) {
         if (!buf_ensure_capacity(b, 1)) return;
         b->line_count = 1;
-        b->lines[0] = strdup("");
+        b->lines[0] = safe_strdup("");
         return;
     }
 
@@ -982,7 +1009,7 @@ static void buffer_deserialize(Buffer *b, const char *text) {
     if (b->line_count == 0) {
         if (buf_ensure_capacity(b, 1)) {
             b->line_count = 1;
-            b->lines[0] = strdup("");
+            b->lines[0] = safe_strdup("");
         }
     }
 }
@@ -1015,7 +1042,14 @@ static char *clipboard_paste_text(void) {
         buf[len++] = (char)c;
     }
     buf[len] = '\0';
-    pclose(pipe);
+    int pclose_rc = pclose(pipe);
+
+    /* If the clipboard tool exited nonzero AND gave us nothing, treat it as
+     * unavailable (xclip/pbpaste not installed) rather than an empty clipboard. */
+    if (pclose_rc != 0 && len == 0) {
+        free(buf);
+        return NULL;
+    }
 
     while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) buf[--len] = '\0';
     return buf;
@@ -1299,6 +1333,7 @@ static int jump_percent(ViewerState *st, int *out_to_line, int *out_to_col, int 
 static void insert_char_at(Buffer *b, int line, int col, char c) {
     char *s = b->lines[line];
     int len = (int)strlen(s);
+    if(len>=MAX_LINE_LEN-1) return;
     if (col < 0) col = 0;
     if (col > len) col = len;
 
@@ -1321,8 +1356,8 @@ static void delete_char_before(Buffer *b, int *line_io, int *col_io) {
     int len = (int)strlen(s);
 
     if (col > 0) {
-        char *ns = (char*)malloc((size_t)len);
-        memcpy(ns, s, (size_t)(col - 1));
+        char *ns = (char*)malloc((size_t)len+1);
+        memcpy(ns, s, (size_t)(col));
         memcpy(ns + (col - 1), s + col, (size_t)(len - col + 1));
         free(b->lines[line]);
         b->lines[line] = ns;
@@ -1357,7 +1392,6 @@ static void insert_newline(Buffer *b, int *line_io, int *col_io) {
     int col = *col_io;
     if (line < 0 || line >= b->line_count) return;
 
-    // [CHANGE 1] grow dynamically instead of hard limit
     if (!buf_ensure_capacity(b, b->line_count + 1)) return;
 
     char *s = b->lines[line];
@@ -1368,7 +1402,7 @@ static void insert_newline(Buffer *b, int *line_io, int *col_io) {
     char *left = (char*)malloc((size_t)col + 1);
     memcpy(left, s, (size_t)col);
     left[col] = '\0';
-    char *right = strdup(s + col);
+    char *right = safe_strdup(s + col);
 
     free(b->lines[line]);
     b->lines[line] = left;
@@ -1503,6 +1537,7 @@ static void delete_range_to_match(ViewerState *st, int aL, int aC, int bL, int b
         if (eC >= sC) {
             int new_len = line_len - (eC - sC + 1);
             char *nl = (char*)malloc((size_t)new_len + 1);
+            if (!nl) { free(tmp); return; }
             memcpy(nl, line, (size_t)sC);
             memcpy(nl + sC, line + eC + 1, (size_t)(line_len - (eC + 1) + 1));
             free(b->lines[sL]);
@@ -1527,6 +1562,7 @@ static void delete_range_to_match(ViewerState *st, int aL, int aC, int bL, int b
     const char *suffix = (eC + 1 <= elen) ? (end_line + eC + 1) : (end_line + elen);
     int suffix_len = (int)strlen(suffix);
     char *joined = (char*)malloc((size_t)prefix_len + (size_t)suffix_len + 1);
+    if (!joined) { free(tmp); return; }
     memcpy(joined, prefix, (size_t)prefix_len);
     memcpy(joined + prefix_len, suffix, (size_t)suffix_len);
     joined[prefix_len + suffix_len] = '\0';
@@ -1546,8 +1582,6 @@ static void delete_range_to_match(ViewerState *st, int aL, int aC, int bL, int b
     free(tmp);
 }
 
-// [CHANGE 2/3] Delete visual selection lines (lo..hi inclusive).
-// Returns a malloc'd string with the deleted content (caller frees).
 static char *delete_visual_lines(ViewerState *st) {
     Buffer *b = &st->buffers[st->current_buffer];
     int lo = st->vis_start < st->vis_end ? st->vis_start : st->vis_end;
@@ -1556,7 +1590,6 @@ static char *delete_visual_lines(ViewerState *st) {
     if (lo < 0) lo = 0;
     if (hi >= b->line_count) hi = b->line_count - 1;
 
-    // Build yanked text
     size_t total = 0;
     for (int i = lo; i <= hi; i++) total += strlen(b->lines[i]) + 1;
     char *out = (char*)malloc(total + 1);
@@ -1567,16 +1600,13 @@ static char *delete_visual_lines(ViewerState *st) {
         if (i != hi) strcat(out, "\n");
     }
 
-    // Push undo before mutating
     undo_push(b);
 
-    // Free deleted lines
     for (int i = lo; i <= hi; i++) {
         free(b->lines[i]);
         b->lines[i] = NULL;
     }
 
-    // Compact the array
     int deleted = hi - lo + 1;
     for (int i = lo; i < b->line_count - deleted; i++)
         b->lines[i] = b->lines[i + deleted];
@@ -1584,15 +1614,13 @@ static char *delete_visual_lines(ViewerState *st) {
         b->lines[i] = NULL;
     b->line_count -= deleted;
 
-    // Always keep at least one line
     if (b->line_count == 0) {
         b->line_count = 1;
-        b->lines[0] = strdup("");
+        b->lines[0] = safe_strdup("");
     }
 
     b->dirty = 1;
 
-    // Place cursor at first deleted line (clamped)
     st->cursor_line = lo;
     st->cursor_col  = 0;
     ensure_cursor_bounds(st);
@@ -1600,7 +1628,6 @@ static char *delete_visual_lines(ViewerState *st) {
     return out;
 }
 
-// [CHANGE 4/5] Yank or delete all lines in the buffer.
 static void yank_all_lines(ViewerState *st) {
     Buffer *b = &st->buffers[st->current_buffer];
     char *snap = buffer_serialize(b);
@@ -1617,7 +1644,7 @@ static void delete_all_lines(ViewerState *st) {
     undo_push(b);
     for (int i = 0; i < b->line_count; i++) { free(b->lines[i]); b->lines[i] = NULL; }
     b->line_count = 1;
-    b->lines[0] = strdup("");
+    b->lines[0] = safe_strdup("");
     b->dirty = 1;
     st->cursor_line = 0;
     st->cursor_col  = 0;
@@ -1682,7 +1709,6 @@ static void shell_quote_single(char *out, size_t out_len, const char *in) {
 
     size_t j = 0;
 
-    // Need at least: "'" + "'" + "\0" => 3 bytes to produce a valid quoted string.
     if (out_len < 3) {
         out[0] = '\0';
         return;
@@ -1692,17 +1718,16 @@ static void shell_quote_single(char *out, size_t out_len, const char *in) {
 
     for (size_t i = 0; in && in[i] != '\0'; i++) {
         if (in[i] == '\'') {
-            // "'\"'\"'" is 6 chars
             const char *esc = "'\"'\"'";
             for (int k = 0; esc[k]; k++) {
-                if (j + 1 >= out_len) { // keep room for NUL
+                if (j + 1 >= out_len) {
                     out[out_len - 1] = '\0';
                     return;
                 }
                 out[j++] = esc[k];
             }
         } else {
-            if (j + 1 >= out_len) { // keep room for NUL
+            if (j + 1 >= out_len) {
                 out[out_len - 1] = '\0';
                 return;
             }
@@ -1710,7 +1735,7 @@ static void shell_quote_single(char *out, size_t out_len, const char *in) {
         }
     }
 
-    if (j + 2 > out_len) { // need space for closing quote + NUL
+    if (j + 2 > out_len) {
         out[out_len - 1] = '\0';
         return;
     }
@@ -1731,7 +1756,6 @@ static int tmux_pane_alive(const char *pane_id) {
     shell_quote_single(qid, sizeof(qid), pane_id);
 
     char cmd[512];
-    // exits nonzero if pane doesn't exist
     snprintf(cmd, sizeof(cmd), "tmux list-panes -F '#{pane_id}' | grep -qx %s", qid);
     return system(cmd) == 0;
 }
@@ -1747,14 +1771,12 @@ static int tmux_kill_pane(const char *pane_id) {
     return system(cmd);
 }
 
-// Returns 0 on success, -1 on failure
 static int tmux_create_bottom_terminal(const char *cwd, char *out_pane, size_t out_len) {
     if (!cwd || !*cwd || !out_pane || out_len == 0) return -1;
 
     char qcwd[2048];
     shell_quote_single(qcwd, sizeof(qcwd), cwd);
 
-    // -P prints info about the new pane, -F chooses the format -> just the pane id
     char cmd[1024];
     snprintf(cmd, sizeof(cmd), "tmux split-window -v -p 30 -c %s -P -F '#{pane_id}'", qcwd);
 
@@ -1774,7 +1796,6 @@ static int tmux_create_bottom_terminal(const char *cwd, char *out_pane, size_t o
     strncpy(out_pane, buf, out_len - 1);
     out_pane[out_len - 1] = '\0';
 
-    // go back to the editor/file pane
     system("tmux last-pane 2>/dev/null");
     return 0;
 }
@@ -1782,7 +1803,6 @@ static void buffer_cwd(const Buffer *b, char *out, size_t out_len) {
     if (!out || out_len == 0) return;
     out[0] = '\0';
 
-    // Prefer the directory of the current file if it has a slash.
     if (b && b->filepath[0] && strcmp(b->filepath, "<stdin>") != 0) {
         const char *slash = strrchr(b->filepath, '/');
         if (slash && slash != b->filepath) {
@@ -1794,7 +1814,6 @@ static void buffer_cwd(const Buffer *b, char *out, size_t out_len) {
         }
     }
 
-    // Fallback: process cwd.
     if (getcwd(out, out_len) == NULL) snprintf(out, out_len, ".");
 }
 static char g_terminal_pane_id[128] = {0};
@@ -1805,33 +1824,10 @@ static void chomp(char *s) {
     size_t n = strlen(s);
     while (n && (s[n-1] == '\n' || s[n-1] == '\r')) s[--n] = '\0';
 }
-static void sh_quote(const char *in, char *out, size_t out_sz) {
-    // output: '...'
-    // replaces ' with '"'"'
-    size_t j = 0;
-    if (out_sz < 3) { if (out_sz) out[0] = 0; return; }
 
-    out[j++] = '\'';
-    for (size_t i = 0; in && in[i]; i++) {
-        if (j + 6 >= out_sz) break;
-        if (in[i] == '\'') {
-            // close ', insert '"'"', reopen '
-            out[j++] = '\'';
-            out[j++] = '"';
-            out[j++] = '\'';
-            out[j++] = '"';
-            out[j++] = '\'';
-        } else {
-            out[j++] = in[i];
-        }
-    }
-    out[j++] = '\'';
-    out[j] = '\0';
-}
 static int tmux_pane_exists_simple(const char *pane_id) {
     if (!pane_id || !*pane_id) return 0;
     char cmd[256];
-    // exact match in current server
     snprintf(cmd, sizeof(cmd),
              "tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx '%s'",
              pane_id);
@@ -1869,7 +1865,6 @@ void tmux_toggle_lldb(const char *cwd) {
     if (!getenv("TMUX")) return;
     char pane[64] = {0};
     tmux_get_window_opt("@vic_lldb_pane", pane, sizeof(pane));
-    // TOGGLE OFF
     if (pane[0] && tmux_pane_exists_simple(pane)) {
         char qpane[256];
         shell_quote_single(qpane, sizeof(qpane), pane);
@@ -1878,21 +1873,17 @@ void tmux_toggle_lldb(const char *cwd) {
         system(cmd);
         return;
     }
-    // stale option (pane died)
     if (pane[0] && !tmux_pane_exists_simple(pane)) {
         tmux_unset_window_opt("@vic_lldb_pane");
         pane[0] = '\0';
     }
-    // TOGGLE ON
     char qcwd[2048];
-    sh_quote((cwd && *cwd) ? cwd : ".", qcwd, sizeof(qcwd));
-    // create the pane (it becomes active)
+    shell_quote_single(qcwd, sizeof(qcwd), (cwd && *cwd) ? cwd : ".");
     {
         char cmd[4096];
         snprintf(cmd, sizeof(cmd), "tmux split-window -h -p 10 -c %s 2>/dev/null", qcwd);
         system(cmd);
     }
-    // read the active pane id (that's the new one), then go back
     {
         FILE *fp = popen("tmux display-message -p '#{pane_id}' 2>/dev/null", "r");
         if (!fp) return;
@@ -1901,12 +1892,12 @@ void tmux_toggle_lldb(const char *cwd) {
             chomp(newpane);
             if (newpane[0]) {
                 tmux_set_window_opt("@vic_lldb_pane", newpane);
-                // Send the lldb command to the new pane
                 char lldb_cmd[512];
-char qnewpane[256];
+                char qnewpane[256];
                 shell_quote_single(qnewpane, sizeof(qnewpane), newpane);
                 snprintf(lldb_cmd, sizeof(lldb_cmd),
-                         "tmux send-keys -t %s 'lldb ./bin/*' Enter 2>/dev/null", qnewpane);                system(lldb_cmd);
+                         "tmux send-keys -t %s 'lldb ./bin/*' Enter 2>/dev/null", qnewpane);
+                system(lldb_cmd);
             }
         }
         pclose(fp);
@@ -1917,7 +1908,6 @@ void tmux_toggle_db(const char *cwd) {
     if (!getenv("TMUX")) return;
     char pane[64] = {0};
     tmux_get_window_opt("@vic_db_pane", pane, sizeof(pane));
-    // TOGGLE OFF
     if (pane[0] && tmux_pane_exists_simple(pane)) {
         char qpane[256];
         shell_quote_single(qpane, sizeof(qpane), pane);
@@ -1927,21 +1917,17 @@ void tmux_toggle_db(const char *cwd) {
         tmux_unset_window_opt("@vic_db_pane");
         return;
     }
-    // stale option (pane died)
     if (pane[0] && !tmux_pane_exists_simple(pane)) {
         tmux_unset_window_opt("@vic_db_pane");
         pane[0] = '\0';
     }
-    // TOGGLE ON
     char qcwd[2048];
-    sh_quote((cwd && *cwd) ? cwd : ".", qcwd, sizeof(qcwd));
-    // create the pane (it becomes active)
+    shell_quote_single(qcwd, sizeof(qcwd), (cwd && *cwd) ? cwd : ".");
     {
         char cmd[4096];
         snprintf(cmd, sizeof(cmd), "tmux split-window -h -p 40 -c %s 2>/dev/null", qcwd);
         system(cmd);
     }
-    // read the active pane id (that's the new one), then go back
     {
         FILE *fp = popen("tmux display-message -p '#{pane_id}' 2>/dev/null", "r");
         if (!fp) return;
@@ -1950,7 +1936,6 @@ void tmux_toggle_db(const char *cwd) {
             chomp(newpane);
             if (newpane[0]) {
                 tmux_set_window_opt("@vic_db_pane", newpane);
-                // Send the data command to the new pane
                 char db_cmd[512];
                 char qnewpane[256];
                 shell_quote_single(qnewpane, sizeof(qnewpane), newpane);
@@ -1963,12 +1948,6 @@ void tmux_toggle_db(const char *cwd) {
         system("tmux last-pane 2>/dev/null");
     }
 }
-// --- fixed: tmux_toggle_peek ---
-// - correctly quotes pane ids & cwd
-// - correctly captures NEW pane ids
-// - correctly splits the peek pane to create a bottom shell pane
-// - clears stale tmux @options
-// - avoids using uninitialized qnewpane
 void tmux_toggle_peek(const char *cwd) {
     if (!getenv("TMUX")) return;
 
@@ -1978,7 +1957,6 @@ void tmux_toggle_peek(const char *cwd) {
     tmux_get_window_opt("@vic_peek_pane", pane, sizeof(pane));
     tmux_get_window_opt("@vic_peek_shell_pane", shell_pane, sizeof(shell_pane));
 
-    // TOGGLE OFF (kill shell first, then main)
     if (pane[0] && tmux_pane_exists_simple(pane)) {
         if (shell_pane[0] && tmux_pane_exists_simple(shell_pane)) {
             char qshell[256];
@@ -2001,7 +1979,6 @@ void tmux_toggle_peek(const char *cwd) {
         return;
     }
 
-    // stale options (pane died)
     if (pane[0] && !tmux_pane_exists_simple(pane)) {
         tmux_unset_window_opt("@vic_peek_pane");
         tmux_unset_window_opt("@vic_peek_shell_pane");
@@ -2009,18 +1986,15 @@ void tmux_toggle_peek(const char *cwd) {
         shell_pane[0] = '\0';
     }
 
-    // TOGGLE ON
     char qcwd[2048];
-    sh_quote((cwd && *cwd) ? cwd : ".", qcwd, sizeof(qcwd));
+    shell_quote_single(qcwd, sizeof(qcwd), (cwd && *cwd) ? cwd : ".");
 
-    // 1) create the main peek pane (becomes active)
     {
         char cmd[4096];
         snprintf(cmd, sizeof(cmd), "tmux split-window -h -p 30 -c %s 2>/dev/null", qcwd);
         system(cmd);
     }
 
-    // 2) capture the new main peek pane id
     char newpane[64] = {0};
     {
         FILE *fp = popen("tmux display-message -p '#{pane_id}' 2>/dev/null", "r");
@@ -2031,13 +2005,11 @@ void tmux_toggle_peek(const char *cwd) {
         pclose(fp);
     }
     if (!newpane[0]) {
-        // couldn't capture pane id; best-effort return
         system("tmux last-pane 2>/dev/null");
         return;
     }
     tmux_set_window_opt("@vic_peek_pane", newpane);
 
-    // 3) run peek in the new pane
     {
         char qnewpane[256];
         shell_quote_single(qnewpane, sizeof(qnewpane), newpane);
@@ -2049,8 +2021,6 @@ void tmux_toggle_peek(const char *cwd) {
         system(peek_cmd);
     }
 
-    // 4) split the peek pane vertically to create a bottom shell (30% of that pane)
-    // NOTE: -t targets the peek pane id (quoted)
     {
         char qnewpane[256];
         shell_quote_single(qnewpane, sizeof(qnewpane), newpane);
@@ -2062,7 +2032,6 @@ void tmux_toggle_peek(const char *cwd) {
         system(split_cmd);
     }
 
-    // 5) capture the new shell pane id (it is now active)
     char new_shell_pane[64] = {0};
     {
         FILE *fp = popen("tmux display-message -p '#{pane_id}' 2>/dev/null", "r");
@@ -2079,7 +2048,6 @@ void tmux_toggle_peek(const char *cwd) {
         tmux_set_window_opt("@vic_peek_shell_pane", new_shell_pane);
     }
 
-    // 6) return to the original pane (pre-toggle)
     system("tmux last-pane 2>/dev/null");
 }
 void tmux_toggle_terminal(const char *cwd) {
@@ -2088,7 +2056,6 @@ void tmux_toggle_terminal(const char *cwd) {
     char pane[64] = {0};
     tmux_get_window_opt("@vic_term_pane", pane, sizeof(pane));
 
-    // TOGGLE OFF
     if (pane[0] && tmux_pane_exists_simple(pane)) {
         char qpane[256];
         shell_quote_single(qpane, sizeof(qpane), pane);
@@ -2099,24 +2066,20 @@ void tmux_toggle_terminal(const char *cwd) {
         return;
     }
 
-    // stale option (pane died)
     if (pane[0] && !tmux_pane_exists_simple(pane)) {
         tmux_unset_window_opt("@vic_term_pane");
         pane[0] = '\0';
     }
 
-    // TOGGLE ON
     char qcwd[2048];
-    sh_quote((cwd && *cwd) ? cwd : ".", qcwd, sizeof(qcwd));
+    shell_quote_single(qcwd, sizeof(qcwd), (cwd && *cwd) ? cwd : ".");
 
-    // create the pane (it becomes active)
     {
         char cmd[4096];
         snprintf(cmd, sizeof(cmd), "tmux split-window -v -l 30%% -c %s 2>/dev/null", qcwd);
         system(cmd);
     }
 
-    // read the active pane id (that's the new one), then go back
     {
         FILE *fp = popen("tmux display-message -p '#{pane_id}' 2>/dev/null", "r");
         if (!fp) return;
@@ -2131,56 +2094,6 @@ void tmux_toggle_terminal(const char *cwd) {
         system("tmux last-pane 2>/dev/null");
     }
 }
-// very small shell quote helper for paths
-
-static int tmux_run_capture(const char *cmd, char *out, size_t outlen) {
-    if (!out || outlen == 0) return -1;
-    out[0] = '\0';
-
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
-
-    if (!fgets(out, (int)outlen, fp)) {
-        pclose(fp);
-        return -1;
-    }
-    pclose(fp);
-
-    // trim \r\n
-    out[strcspn(out, "\r\n")] = '\0';
-    return out[0] ? 0 : -1;
-}
-
-static int tmux_pane_exists_grep(const char *pane_id) {
-    if (!pane_id || !*pane_id) return 0;
-
-    char qid[256];
-    shell_quote_single(qid, sizeof(qid), pane_id);
-
-    char cmd[512];
-    // -a = all sessions, safe; -F = only pane_id; grep exact whole-line match
-    snprintf(cmd, sizeof(cmd),
-             "tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fxq -- %s",
-             qid);
-    return system(cmd) == 0;
-}
-static int tmux_capture_first_line(const char *cmd, char *out, size_t outlen) {
-    if (!out || outlen == 0) return -1;
-    out[0] = '\0';
-
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
-
-    if (!fgets(out, (int)outlen, fp)) {
-        pclose(fp);
-        return -1;
-    }
-    pclose(fp);
-
-    out[strcspn(out, "\r\n")] = '\0';
-    return out[0] ? 0 : -1;
-}
-
 
 static void add_buffer_from_file(ViewerState *st, const char *path) {
     if (!st) return;
@@ -2191,7 +2104,6 @@ static void add_buffer_from_file(ViewerState *st, const char *path) {
     set_status(st, "No path provided");
 }
 
-// --- Buffers list picker: nfzf -> fzf -> manual fallback ---
 static void cmd_list_buffers(ViewerState *st) {
     if (!st) return;
 
@@ -2206,14 +2118,13 @@ static void cmd_list_buffers(ViewerState *st) {
     char list_template[] = "/tmp/nbl_vic_buflist_XXXXXX";
     int fd = mkstemp(list_template);
     temp_register_path(list_template);
-temp_register_path(list_template);
-  if (fd < 0) { set_status(st, "Failed to create temp file"); return; }
+    if (fd < 0) { set_status(st, "Failed to create temp file"); return; }
 
     FILE *list_file = fdopen(fd, "w");
     if (!list_file) {
         close(fd);
         unlink(list_template);
-
+        temp_forget_path(list_template);
         set_status(st, "Failed to open temp file");
         return;
     }
@@ -2232,13 +2143,15 @@ temp_register_path(list_template);
 
     char result_template[] = "/tmp/nbl_vic_bufpick_XXXXXX";
     int result_fd = mkstemp(result_template);
-temp_register_path(result_template);
-if (result_fd < 0) {
+    temp_register_path(result_template);
+    if (result_fd < 0) {
         unlink(list_template);
+        temp_forget_path(list_template);
         set_status(st, "Failed to create result file");
         return;
     }
-    close(result_fd);
+    /* Do NOT close result_fd - keep it open so we read back through our own fd
+     * after fzf writes, eliminating the TOCTOU window. */
 
     char cmd[8192];
     if (have_nfzf) {
@@ -2260,15 +2173,27 @@ if (result_fd < 0) {
     refresh();
 
     unlink(list_template);
+    temp_forget_path(list_template);
 
     if (rc != 0) {
+        close(result_fd);
         unlink(result_template);
+        temp_forget_path(result_template);
         return;
     }
 
-    FILE *result_file = fopen(result_template, "r");
-    if (!result_file) {
+    /* Seek back to start and read through our own fd - no re-open by name */
+    if (lseek(result_fd, 0, SEEK_SET) < 0) {
+        close(result_fd);
         unlink(result_template);
+        temp_forget_path(result_template);
+        return;
+    }
+    FILE *result_file = fdopen(result_fd, "r");
+    if (!result_file) {
+        close(result_fd);
+        unlink(result_template);
+        temp_forget_path(result_template);
         set_status(st, "Failed to read selection");
         return;
     }
@@ -2277,10 +2202,12 @@ if (result_fd < 0) {
     if (!fgets(buf, sizeof(buf), result_file)) {
         fclose(result_file);
         unlink(result_template);
+        temp_forget_path(result_template);
         return;
     }
-    fclose(result_file);
+    fclose(result_file); /* also closes result_fd */
     unlink(result_template);
+    temp_forget_path(result_template);
 
     int buffer_num = atoi(buf);
     if (buffer_num >= 1 && buffer_num <= st->buffer_count) {
@@ -2444,17 +2371,15 @@ static void draw_buffer(ViewerState *st) {
     int max_x = getmaxx(stdscr);
     int h     = content_height();
 
-    const int line_nr_width = line_nr_width_for(st);   // 6 or 0
-    const int start_x       = line_nr_width + 1;       // where text starts
+    const int line_nr_width = line_nr_width_for(st);
+    const int start_x       = line_nr_width + 1;
     const int do_search_hl  = (st->search_highlight && st->search_term[0] != '\0');
 
-    // Clear the content area (everything above the status divider)
     for (int y = 0; y < h; y++) {
         move(y, 0);
         clrtoeol();
     }
 
-    // Visual selection range (line-based)
     int sel_lo = 0, sel_hi = -1;
     if (st->mode == MODE_VISUAL) {
         sel_lo = (st->vis_start < st->vis_end) ? st->vis_start : st->vis_end;
@@ -2463,15 +2388,11 @@ static void draw_buffer(ViewerState *st) {
         if (sel_hi >= b->line_count) sel_hi = b->line_count - 1;
     }
 
-    // ------------------------------------------------------------
-    // NO WRAP: 1 logical line -> 1 screen row
-    // ------------------------------------------------------------
     if (!st->wrap_enabled) {
         for (int y = 0; y < h; y++) {
             int line_idx = b->scroll_offset + y;
             if (line_idx < 0 || line_idx >= b->line_count) continue;
 
-            // Line number column
             if (st->show_line_numbers) {
                 attron(COLOR_PAIR(COLOR_LINENR));
                 mvprintw(y, 1, "%4d ", line_idx + 1);
@@ -2488,9 +2409,6 @@ static void draw_buffer(ViewerState *st) {
         return;
     }
 
-    // ------------------------------------------------------------
-    // WRAP: 1 logical line -> N screen rows ("segments")
-    // ------------------------------------------------------------
     const int text_w = text_width_for(st);
 
     int y = 0;
@@ -2503,14 +2421,12 @@ static void draw_buffer(ViewerState *st) {
         const int in_sel = (st->mode == MODE_VISUAL && logical >= sel_lo && logical <= sel_hi);
 
         for (int seg = 0; seg < wl.count && y < h; seg++) {
-            // Line number: only on the first wrapped row of the logical line
             if (st->show_line_numbers) {
                 if (seg == 0) {
                     attron(COLOR_PAIR(COLOR_LINENR));
                     mvprintw(y, 1, "%4d ", logical + 1);
                     attroff(COLOR_PAIR(COLOR_LINENR));
                 } else {
-                    // Keep alignment for continuation rows
                     mvprintw(y, 1, "     ");
                 }
             }
@@ -2573,7 +2489,7 @@ static void draw_ui(ViewerState *st) {
     if (st->mode == MODE_COMMAND) {
         int max_y = getmaxy(stdscr);
         int y = max_y - 1;
-        int x = 2 + st->cmdlen; // ":" at x=1 visually
+        int x = 2 + st->cmdlen;
         if (x >= getmaxx(stdscr)) x = getmaxx(stdscr) - 1;
         move(y, x);
     } else {
@@ -2598,7 +2514,7 @@ static void cmdhist_add(ViewerState *st, const char *cmd) {
         st->cmdhist_len--;
     }
 
-    st->cmdhist[st->cmdhist_len++] = strdup(cmd);
+    st->cmdhist[st->cmdhist_len++] = safe_strdup(cmd);
     st->cmdhist_pos = st->cmdhist_len;
 }
 
@@ -2671,7 +2587,85 @@ static void exec_command(ViewerState *st, const char *cmd, int *running) {
     }
     if (strcmp(tok, "?") == 0) { cmd_show_help(st); return; }
     if (strcmp(tok, "qa!") == 0 || strcmp(tok, "qall!") == 0) { *running = 0; return; }
+    /* :s/pattern/replacement/  or  :s/pattern/replacement/g */
+if (tok[0] == 's' && tok[1] == '\0') {
+    if (!p || !*p) { set_status(st, "Usage: :s /pat/repl/ or :s /pat/repl/g"); return; }
+    char delim = p[0];
+    const char *seg1 = p + 1;
+    const char *seg2 = strchr(seg1, delim);
+    if (!seg2) { set_status(st, "Bad substitution syntax"); return; }
+    char pattern[256] = {0};
+    int plen = (int)(seg2 - seg1);
+    if (plen <= 0) { set_status(st, "Empty pattern"); return; }
+    if (plen >= (int)sizeof(pattern)) { set_status(st, "Pattern too long"); return; }
+    memcpy(pattern, seg1, (size_t)plen);
 
+    const char *seg3 = seg2 + 1;
+    const char *seg4 = strchr(seg3, delim);
+    char replacement[256] = {0};
+    int rlen = seg4 ? (int)(seg4 - seg3) : (int)strlen(seg3);
+    if (rlen >= (int)sizeof(replacement)) { set_status(st, "Replacement too long"); return; }
+    if (rlen > 0) memcpy(replacement, seg3, (size_t)rlen);
+
+    /* flags: g = replace all occurrences per line (default: first only) */
+    int global = 0;
+    if (seg4) {
+        const char *flags = seg4 + 1;
+        while (*flags) { if (*flags == 'g') global = 1; flags++; }
+    }
+
+    undo_push(b);
+    int total = 0;
+    int patlen = plen;
+    int replen = rlen;
+
+    for (int li = 0; li < b->line_count; li++) {
+        char *line = b->lines[li];
+        /* count occurrences to size the output buffer */
+        int occurrences = 0;
+        const char *scan = line;
+        while ((scan = strstr(scan, pattern))) { occurrences++; scan += patlen; }
+        if (occurrences == 0) continue;
+        if (!global) occurrences = 1;
+
+        int orig_len = (int)strlen(line);
+        int new_len = orig_len + occurrences * (replen - patlen);
+        if (new_len < 0) new_len = 0;
+        char *out = (char*)malloc((size_t)new_len + 1);
+        if (!out) { set_status(st, "Out of memory"); return; }
+
+        char *wp = out;
+        const char *rp = line;
+        int replaced = 0;
+        while (*rp) {
+            if ((!global || 1) && (global ? 1 : replaced < 1) &&
+                strncmp(rp, pattern, (size_t)patlen) == 0 &&
+                (global || replaced == 0)) {
+                memcpy(wp, replacement, (size_t)replen);
+                wp += replen;
+                rp += patlen;
+                replaced++;
+                total++;
+            } else {
+                *wp++ = *rp++;
+            }
+        }
+        *wp = '\0';
+
+        free(b->lines[li]);
+        b->lines[li] = out;
+    }
+
+    if (total == 0) {
+        set_status(st, "No matches");
+    } else {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Replaced %d occurrence%s", total, total == 1 ? "" : "s");
+        set_status(st, msg);
+    }
+    b->dirty = 1;
+    return;
+}
     if (strcmp(tok, "q") == 0) {
         Buffer *cur = &st->buffers[st->current_buffer];
         if (!cur->dirty) { close_current_buffer(st); return; }
@@ -2694,25 +2688,21 @@ static void exec_command(ViewerState *st, const char *cmd, int *running) {
     if (strcmp(tok, "ls") == 0 || strcmp(tok, "buffers") == 0) { cmd_list_buffers(st); return; }
 
     if (strcmp(tok, "b") == 0) {
-        // :b new
         if (strncmp(p, "new", 3) == 0 && (p[3] == '\0' || isspace((unsigned char)p[3]))) {
             add_blank_buffer(st);
             return;
         }
 
-        // :b n
         if (strncmp(p, "n", 1) == 0 && (p[1] == '\0' || isspace((unsigned char)p[1]))) {
             next_buffer(st);
             return;
         }
 
-        // :b p
         if (strncmp(p, "p", 1) == 0 && (p[1] == '\0' || isspace((unsigned char)p[1]))) {
             prev_buffer(st);
             return;
         }
 
-        // :b add / :b a
         if (strncmp(p, "add", 3) == 0 || (strncmp(p, "a", 1) == 0 && (p[1] == '\0' || isspace((unsigned char)p[1])))) {
             char *picked = pick_file();
             if (!picked) {
@@ -2724,7 +2714,6 @@ static void exec_command(ViewerState *st, const char *cmd, int *running) {
             return;
         }
 
-        // :b <num>
         if (*p && isdigit((unsigned char)*p)) {
             long n = strtol(p, NULL, 10);
             if (n >= 1 && n <= st->buffer_count) {
@@ -2768,8 +2757,8 @@ static void cmd_show_help(ViewerState *st) {
 
     char help_template[] = "/tmp/nbl_vic_help_XXXXXX";
     int fd = mkstemp(help_template);
-temp_register_path(help_template);
-if (fd < 0) {
+    temp_register_path(help_template);
+    if (fd < 0) {
         set_status(st, "Failed to create temp file");
         return;
     }
@@ -2778,7 +2767,7 @@ if (fd < 0) {
     if (!help_file) {
         close(fd);
         unlink(help_template);
-temp_forget_path(help_template);
+        temp_forget_path(help_template);
         set_status(st, "Failed to open temp file");
         return;
     }
@@ -2877,6 +2866,7 @@ temp_forget_path(help_template);
     refresh();
 
     unlink(help_template);
+    temp_forget_path(help_template);
 }
 
 static void handle_command_key(ViewerState *st, int ch, int *running) {
@@ -2967,7 +2957,6 @@ static void handle_input(ViewerState *st, int *running) {
             return;
         }
 
-        // [CHANGE 3] d in visual: delete the selected lines
         if (ch == 'd') {
             char *deleted = delete_visual_lines(st);
             if (deleted) {
@@ -2981,18 +2970,13 @@ static void handle_input(ViewerState *st, int *running) {
             return;
         }
 
-        // [CHANGE 2] p in visual: replace selection with clipboard
         if (ch == 'p') {
             char *clip = clipboard_paste_text();
-            // Delete selection first (this also pushes undo)
             char *deleted = delete_visual_lines(st);
             free(deleted);
             st->mode = MODE_NORMAL;
             st->op_pending = OP_NONE;
             if (clip) {
-                // paste_text_at_cursor calls undo_push internally; since we
-                // already pushed in delete_visual_lines, collapse to one step
-                // by inserting directly without a second undo snapshot.
                 for (const char *p = clip; *p; p++) {
                     if (*p == '\n') insert_newline(b, &st->cursor_line, &st->cursor_col);
                     else {
@@ -3014,7 +2998,6 @@ static void handle_input(ViewerState *st, int *running) {
             st->op_pending = OP_NONE;
             return;
         }
-        // Handle movement in visual mode to update selection
         if (ch == 'j' || ch == KEY_DOWN) {
             move_down(st);
             st->vis_end = st->cursor_line;
@@ -3041,7 +3024,7 @@ static void handle_input(ViewerState *st, int *running) {
             ensure_cursor_visible(st);
             return;
         }
-        return; // swallow unhandled keys in visual mode
+        return;
     }
 
     // -------------------------------------------------------
@@ -3056,15 +3039,12 @@ static void handle_input(ViewerState *st, int *running) {
     }
 
     // -------------------------------------------------------
-    // NORMAL MODE — %-prefix  (%y = yank all, %d = delete all)
+    // NORMAL MODE — %-prefix
     // -------------------------------------------------------
-    // [CHANGE 4/5]
     if (st->percent_pending) {
         st->percent_pending = 0;
         if (ch == 'y') { yank_all_lines(st); return; }
         if (ch == 'd') { delete_all_lines(st); ensure_cursor_visible(st); return; }
-        // Not a recognised follow-up: fall through and treat % as bracket jump
-        // (handled below in op_pending or switch)
     }
 
     // -------------------------------------------------------
@@ -3073,7 +3053,6 @@ static void handle_input(ViewerState *st, int *running) {
     if (st->op_pending != OP_NONE) {
         if (ch == 27) { st->op_pending = OP_NONE; return; }
 
-        // Handle yy (yank line)
         if (ch == 'y' && st->op_pending == OP_YANK) {
             clipboard_copy_text(b->lines[st->cursor_line]);
             set_status(st, "Yanked line");
@@ -3081,7 +3060,6 @@ static void handle_input(ViewerState *st, int *running) {
             return;
         }
 
-        // Handle dd (delete line)
         if (ch == 'd' && st->op_pending == OP_DELETE) {
             clipboard_copy_text(b->lines[st->cursor_line]);
             undo_push(b);
@@ -3093,7 +3071,7 @@ static void handle_input(ViewerState *st, int *running) {
             b->line_count--;
             if (b->line_count <= 0) {
                 b->line_count = 1;
-                b->lines[0] = strdup("");
+                b->lines[0] = safe_strdup("");
                 st->cursor_line = 0;
             }
             if (st->cursor_line >= b->line_count) {
@@ -3247,40 +3225,52 @@ static void handle_input(ViewerState *st, int *running) {
             st->op_start_line = st->cursor_line;
             st->op_start_col  = st->cursor_col;
             return;
-case 'Y':
-    yank_all_lines(st);
-    set_status(st, "Yanked all lines");
-    return;
-
-case 'X':
-    delete_all_lines(st);
-    set_status(st, "Deleted all lines");
-    ensure_cursor_bounds(st);
-    ensure_cursor_visible(st);
-    return;
-case '0':
-case KEY_HOME:
-    st->cursor_col = 0;
-        return;
-        
+        case 'Y':
+            yank_all_lines(st);
+            set_status(st, "Yanked all lines");
+            return;
+        case 'X':
+            delete_all_lines(st);
+            set_status(st, "Deleted all lines");
+            ensure_cursor_bounds(st);
+            ensure_cursor_visible(st);
+            return;
+        case '0':
+        case KEY_HOME:
+            st->cursor_col = 0;
+            return;
         case '$':
         case KEY_END: {
-                Buffer *b2 = &st->buffers[st->current_buffer];
-                    st->cursor_col = (int)strlen(b2->lines[st->cursor_line]);
-                        return;
-                        }
-case '%': {
-    int toL, toC, fromL, fromC;
-    if (jump_percent(st, &toL, &toC, &fromL, &fromC)) {
-        st->cursor_line = toL;
-        st->cursor_col  = toC;
-        ensure_cursor_bounds(st);
-        ensure_cursor_visible(st);
-    } else {
-        set_status(st, "No match");
-    }
-    return;
-}
+            Buffer *b2 = &st->buffers[st->current_buffer];
+            st->cursor_col = (int)strlen(b2->lines[st->cursor_line]);
+            return;
+        }
+        case '%': {
+            /* Check for %y / %d (all-lines ops) first */
+            st->percent_pending = 1;
+            /* Also handle as bracket jump if no follow-up recognized */
+            /* We set percent_pending; if the next key isn't y/d,
+               we fall back to a bracket jump in the next handle_input call.
+               But we also do the bracket jump immediately here if we're NOT
+               expecting %y/%d - keep both paths: set the flag AND do the jump
+               so that plain % still works on the same keypress. */
+            int toL, toC, fromL, fromC;
+            if (jump_percent(st, &toL, &toC, &fromL, &fromC)) {
+                /* Store result; will be used if next key isn't y/d.
+                   For simplicity, just jump immediately and also set pending.
+                   The %y / %d path sets percent_pending before the switch,
+                   so plain % should jump now. */
+                st->percent_pending = 0; /* consume it - plain % jumps now */
+                st->cursor_line = toL;
+                st->cursor_col  = toC;
+                ensure_cursor_bounds(st);
+                ensure_cursor_visible(st);
+            } else {
+                /* No bracket - might be %y or %d coming next */
+                /* percent_pending already set above */
+            }
+            return;
+        }
         default:
             return;
     }
@@ -3302,7 +3292,6 @@ static void handle_insert_key(ViewerState *st, int ch) {
     if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
         insert_undo_maybe_push(st, b);
 
-        // Delete matching pair if cursor is sitting between them: (|) [|] {|} etc.
         if (st->cursor_col > 0 && st->cursor_line >= 0 && st->cursor_line < b->line_count) {
             const char *line = b->lines[st->cursor_line];
             int col = st->cursor_col;
@@ -3320,15 +3309,13 @@ static void handle_insert_key(ViewerState *st, int ch) {
                     case '`': expected_close = '`'; break;
                 }
                 if (expected_close && after == expected_close) {
-                    // Remove the closing char first (it's at cursor_col)
-                    char *ns = (char*)malloc((size_t)len);
+                    char *ns = (char*)malloc((size_t)len+1);
                     memcpy(ns, line, (size_t)(col));
                     memcpy(ns + col, line + col + 1, (size_t)(len - col));
                     ns[len - 1] = '\0';
                     free(b->lines[st->cursor_line]);
                     b->lines[st->cursor_line] = ns;
                     b->dirty = 1;
-                    // Now fall through to delete the opening char normally
                 }
             }
         }
@@ -3341,14 +3328,12 @@ static void handle_insert_key(ViewerState *st, int ch) {
     if (ch == '\n' || ch == '\r' || ch == KEY_ENTER) {
         insert_undo_maybe_push(st, b);
 
-        // Capture indentation from current line before splitting
         const char *cur_line = b->lines[st->cursor_line];
         int cur_len = (int)strlen(cur_line);
         int ws_len = 0;
         while (ws_len < cur_len && (cur_line[ws_len] == ' ' || cur_line[ws_len] == '\t'))
             ws_len++;
 
-        // Check if cursor is between { and } -> smart brace expansion
         int col = st->cursor_col;
         int add_extra = 0;
         if (col > 0 && col <= cur_len) {
@@ -3357,7 +3342,6 @@ static void handle_insert_key(ViewerState *st, int ch) {
             if (before == '{' && after == '}') add_extra = 1;
         }
 
-        // Copy indent string before the buffer is modified
         char indent[MAX_LINE_LEN];
         int copy = (ws_len < (int)sizeof(indent) - 1) ? ws_len : (int)sizeof(indent) - 1;
         memcpy(indent, cur_line, (size_t)copy);
@@ -3365,31 +3349,26 @@ static void handle_insert_key(ViewerState *st, int ch) {
 
         insert_newline(b, &st->cursor_line, &st->cursor_col);
 
-        // Insert base indentation on new line
         for (int i = 0; i < copy; i++) {
             insert_char_at(b, st->cursor_line, st->cursor_col, indent[i]);
             st->cursor_col++;
         }
 
         if (add_extra) {
-            // Add one extra indent level (4 spaces) on the inner line
             for (int i = 0; i < 4; i++) {
                 insert_char_at(b, st->cursor_line, st->cursor_col, ' ');
                 st->cursor_col++;
             }
 
-            // Save where we want the cursor to end up
             int inner_line = st->cursor_line;
             int inner_col  = st->cursor_col;
 
-            // Push the closing brace onto its own line with base indent
             insert_newline(b, &st->cursor_line, &st->cursor_col);
             for (int i = 0; i < copy; i++) {
                 insert_char_at(b, st->cursor_line, st->cursor_col, indent[i]);
                 st->cursor_col++;
             }
 
-            // Restore cursor to inner line, after the extra indent
             st->cursor_line = inner_line;
             st->cursor_col  = inner_col;
         }
@@ -3410,7 +3389,6 @@ static void handle_insert_key(ViewerState *st, int ch) {
     if (isprint(ch)) {
         insert_undo_maybe_push(st, b);
 
-        // Determine auto-close partner
         char close = 0;
         switch (ch) {
             case '(': close = ')'; break;
@@ -3421,8 +3399,6 @@ static void handle_insert_key(ViewerState *st, int ch) {
             case '`': close = '`'; break;
         }
 
-        // For closing brackets: if the char under the cursor is already the
-        // closing bracket we're about to type, just skip over it.
         if (ch == ')' || ch == ']' || ch == '}') {
             const char *line = b->lines[st->cursor_line];
             if (line[st->cursor_col] == (char)ch) {
@@ -3431,7 +3407,6 @@ static void handle_insert_key(ViewerState *st, int ch) {
             }
         }
 
-        // For symmetric quotes: if next char is the same quote, skip over it.
         if ((ch == '"' || ch == '\'' || ch == '`')) {
             const char *line = b->lines[st->cursor_line];
             if (line[st->cursor_col] == (char)ch) {
@@ -3443,7 +3418,6 @@ static void handle_insert_key(ViewerState *st, int ch) {
         insert_char_at(b, st->cursor_line, st->cursor_col, (char)ch);
         st->cursor_col++;
 
-        // Insert closing character after cursor (cursor stays between pair)
         if (close) {
             insert_char_at(b, st->cursor_line, st->cursor_col, close);
         }
@@ -3483,9 +3457,6 @@ int main(int argc, char *argv[]) {
     int loaded_anything = 0;
     int arg_start = 1;
 
-    // -----------------------------
-    // Parse args
-    // -----------------------------
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--no-wrap") == 0) {
             st->wrap_enabled = 0;
@@ -3499,13 +3470,9 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // -----------------------------
-    // Load inputs
-    // -----------------------------
     int effective_argc = argc - (arg_start - 1);
 
     if (effective_argc < 2) {
-        // No file args
         if (!stdin_is_pipe) {
             usage(argv[0]);
             free(st);
@@ -3521,7 +3488,6 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     } else {
-        // File args
         for (int i = arg_start; i < argc && st->buffer_count < MAX_BUFFERS; i++) {
             if (strcmp(argv[i], "-") == 0) {
                 if (load_stdin(&st->buffers[st->buffer_count]) == 0) {
@@ -3533,7 +3499,6 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            // (1) directory arg -> picker -> open chosen file
             if (is_dir_path(argv[i])) {
                 char *picked = pick_file_from_dir_raw(argv[i]);
                 if (picked) {
@@ -3550,7 +3515,6 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            // normal file
             if (load_file(&st->buffers[st->buffer_count], argv[i]) == 0) {
                 st->buffer_count++;
                 loaded_anything = 1;
@@ -3566,9 +3530,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // -----------------------------
-    // Curses init
-    // -----------------------------
     FILE *tty_in = NULL;
     SCREEN *screen = NULL;
     int curses_started = 0;
@@ -3601,7 +3562,7 @@ int main(int argc, char *argv[]) {
     noecho();
     keypad(stdscr, TRUE);
     curs_set(1);
-
+    halfdelay(1);
     if (has_colors()) {
         start_color();
         use_default_colors();
@@ -3616,7 +3577,6 @@ int main(int argc, char *argv[]) {
         init_pair(COLOR_SEARCH_HL,   COLOR_BLACK,  COLOR_YELLOW);
     }
 
-    // Seed undo
     for (int i = 0; i < st->buffer_count; i++) {
         undo_push(&st->buffers[i]);
     }
@@ -3626,9 +3586,6 @@ int main(int argc, char *argv[]) {
     ensure_cursor_bounds(st);
     ensure_cursor_visible(st);
 
-    // -----------------------------
-    // Main loop
-    // -----------------------------
     int running = 1;
     while (running) {
         if (g_exit_signal) {
@@ -3643,16 +3600,12 @@ int main(int argc, char *argv[]) {
         if (!st->free_scroll) ensure_cursor_visible(st);
     }
 
-    // -----------------------------
-    // Cleanup
-    // -----------------------------
     if (curses_started) {
         endwin();
         if (screen) { delscreen(screen); screen = NULL; }
         if (tty_in) { fclose(tty_in); tty_in = NULL; }
     }
 
-    // temp files: optional (atexit already does it)
     temp_cleanup_all();
 
     for (int i = 0; i < st->buffer_count; i++) free_buffer(&st->buffers[i]);
