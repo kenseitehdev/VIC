@@ -3562,7 +3562,7 @@ int main(int argc, char *argv[]) {
     noecho();
     keypad(stdscr, TRUE);
     curs_set(1);
-    halfdelay(1);
+//    halfdelay(1);
     if (has_colors()) {
         start_color();
         use_default_colors();
