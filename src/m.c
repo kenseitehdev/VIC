@@ -138,7 +138,9 @@ typedef struct {
 #define COLOR_STATUS       7
 #define COLOR_COPY_SELECT  8
 #define COLOR_SEARCH_HL    9
-
+static void draw_ui(ViewerState *st);
+static void rtrim(char *s);
+static void show_def_popup(ViewerState *st);
 static void handle_insert_key(ViewerState *st, int ch);
 static void cmd_show_help(ViewerState *st);
 static Language detect_language(const char *filepath);
@@ -342,6 +344,221 @@ static int is_dir_path(const char *path) {
     return S_ISDIR(st.st_mode);
 }
 
+typedef struct {
+    char filepath[1024];
+    int  lineno;
+    char text[512];
+} DefResult;
+
+#define DEF_MAX_RESULTS 64
+
+static int word_under_cursor(const char *line, int col, char *out, int out_len) {
+    if (!line || !out || out_len <= 0) return 0;
+    int len = (int)strlen(line);
+    if (col < 0 || col > len) col = len;
+
+    if (col == len || !(isalnum((unsigned char)line[col]) || line[col] == '_'))
+        col--;
+    if (col < 0) return 0;
+    if (!(isalnum((unsigned char)line[col]) || line[col] == '_')) return 0;
+
+    int start = col;
+    while (start > 0 && (isalnum((unsigned char)line[start-1]) || line[start-1] == '_'))
+        start--;
+    int end = col;
+    while (end + 1 < len && (isalnum((unsigned char)line[end+1]) || line[end+1] == '_'))
+        end++;
+
+    int wlen = end - start + 1;
+    if (wlen <= 0 || wlen >= out_len) return 0;
+    memcpy(out, line + start, (size_t)wlen);
+    out[wlen] = '\0';
+    return wlen;
+}
+
+static void build_def_pattern(const char *word, char *out, int out_len) {
+    snprintf(out, (size_t)out_len,
+        "\\b%s\\s*\\("
+        "|\\b%s\\s*[=;{]"
+        "|(?:^|\\s)(?:def|func|function|fn|sub|proc|method)\\s+%s\\b"
+        "|(?:^|\\s)(?:struct|class|enum|union|interface|trait|type|typedef)\\s+[^;{\\n]*?\\b%s\\b"
+        "|^\\s*(?:let|const|var|auto|static|extern|register)\\s[^=\\n]*\\b%s\\b",
+        word, word, word, word, word);
+}
+
+static int run_rg_for_def(const char *cwd, const char *pattern,
+                           const char *current_file,
+                           DefResult *results, int max_results) {
+    if (!cwd || !pattern || !results || max_results <= 0) return 0;
+
+    char qcwd[4096], qpat[2048];
+    shell_quote_single(qcwd, sizeof(qcwd), cwd);
+    shell_quote_single(qpat, sizeof(qpat), pattern);
+
+    char cmd[8192];
+    snprintf(cmd, sizeof(cmd),
+             "cd %s && rg --line-number --no-heading --no-column "
+             "--max-count=4 --max-filesize=2M "
+             "-e %s 2>/dev/null | head -n %d",
+             qcwd, qpat, max_results);
+
+    FILE *p = popen(cmd, "r");
+    if (!p) return 0;
+
+    int count = 0;
+    char buf[2048];
+    while (count < max_results && fgets(buf, sizeof(buf), p)) {
+        trim_newlines(buf);
+        if (!buf[0]) continue;
+
+        /* find :lineno: by scanning backwards for :<digits>: */
+        char *p1 = NULL;
+        {
+            char *scan = buf + strlen(buf);
+            while (scan > buf) {
+                scan--;
+                if (*scan != ':') continue;
+                char *num_start = scan + 1;
+                char *num_end   = num_start;
+                while (*num_end && isdigit((unsigned char)*num_end)) num_end++;
+                if (num_end > num_start && *num_end == ':') { p1 = scan; break; }
+            }
+        }
+        if (!p1) continue;
+
+        size_t fp_len = (size_t)(p1 - buf);
+        if (fp_len == 0 || fp_len >= sizeof(results[count].filepath)) continue;
+        memcpy(results[count].filepath, buf, fp_len);
+        results[count].filepath[fp_len] = '\0';
+
+        results[count].lineno = atoi(p1 + 1);
+        if (results[count].lineno <= 0) continue;
+
+        char *text_start = strchr(p1 + 1, ':');
+        if (!text_start) continue;
+        text_start++;
+        while (*text_start == ' ' || *text_start == '\t') text_start++;
+        snprintf(results[count].text, sizeof(results[count].text), "%s", text_start);
+        rtrim(results[count].text);
+
+        (void)current_file;
+        count++;
+    }
+    pclose(p);
+    return count;
+}
+
+static int draw_def_popup(ViewerState *st,
+                          const char *word,
+                          DefResult *results, int count) {
+    int max_y = getmaxy(stdscr);
+    int max_x = getmaxx(stdscr);
+
+    int popup_w = max_x * 3 / 4;
+    if (popup_w < 60) popup_w = 60;
+    if (popup_w > max_x - 4) popup_w = max_x - 4;
+
+    int popup_h = count + 4;
+    if (popup_h > max_y - 4) popup_h = max_y - 4;
+    if (popup_h < 5) popup_h = 5;
+
+    int start_y = (max_y - popup_h) / 2;
+    int start_x = (max_x - popup_w) / 2;
+    if (start_y < 0) start_y = 0;
+    if (start_x < 0) start_x = 0;
+
+    int selected = 0;
+    int running  = 1;
+
+    while (running) {
+        /* top border */
+        attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        mvaddch(start_y, start_x, ACS_ULCORNER);
+        char title[256];
+        snprintf(title, sizeof(title), " Definition: %s ", word);
+        int title_len = (int)strlen(title);
+        int fill = popup_w - 2 - title_len;
+        if (fill < 0) fill = 0;
+        mvprintw(start_y, start_x + 1, "%s", title);
+        for (int i = 0; i < fill; i++)
+            mvaddch(start_y, start_x + 1 + title_len + i, ACS_HLINE);
+        mvaddch(start_y, start_x + popup_w - 1, ACS_URCORNER);
+        attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+
+        int inner_w = popup_w - 2;
+
+        for (int row = 0; row < popup_h - 2; row++) {
+            int y = start_y + 1 + row;
+
+            attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+            mvaddch(y, start_x, ACS_VLINE);
+            mvaddch(y, start_x + popup_w - 1, ACS_VLINE);
+            attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+
+            attron(COLOR_PAIR(COLOR_NORMAL));
+            for (int c = 0; c < inner_w; c++)
+                mvaddch(y, start_x + 1 + c, ' ');
+
+            if (row < count) {
+                const char *fp = results[row].filepath;
+                const char *slash2 = fp;
+                int slashes = 0;
+                for (const char *q = fp + strlen(fp) - 1; q >= fp; q--) {
+                    if (*q == '/') { slashes++; if (slashes == 2) { slash2 = q + 1; break; } }
+                }
+                char row_text[512];
+                snprintf(row_text, sizeof(row_text), "%s:%d  %s",
+                         slash2, results[row].lineno, results[row].text);
+                int avail = inner_w - 4;
+                if (avail < 1) avail = 1;
+
+                if (row == selected) {
+                    attron(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE | A_BOLD);
+                    mvprintw(y, start_x + 1, " > ");
+                } else {
+                    attron(COLOR_PAIR(COLOR_NORMAL));
+                    mvprintw(y, start_x + 1, "   ");
+                }
+                mvprintw(y, start_x + 4, "%.*s", avail, row_text);
+                attroff(A_REVERSE | A_BOLD);
+
+            } else if (row == count) {
+                attron(COLOR_PAIR(COLOR_COMMENT));
+                mvprintw(y, start_x + 2, "j/k navigate  Enter jump  ESC close");
+                attroff(COLOR_PAIR(COLOR_COMMENT));
+            }
+
+            attroff(COLOR_PAIR(COLOR_NORMAL));
+        }
+
+        /* bottom border */
+        attron(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+        mvaddch(start_y + popup_h - 1, start_x, ACS_LLCORNER);
+        for (int i = 1; i < popup_w - 1; i++)
+            mvaddch(start_y + popup_h - 1, start_x + i, ACS_HLINE);
+        mvaddch(start_y + popup_h - 1, start_x + popup_w - 1, ACS_LRCORNER);
+        attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
+
+        move(start_y + 1 + selected, start_x + 2);
+        refresh();
+
+        int ch = getch();
+        switch (ch) {
+            case 27:        running = 0; selected = -1; break;
+            case 'k':
+            case KEY_UP:    if (selected > 0) selected--; break;
+            case 'j':
+            case KEY_DOWN:  if (selected < count - 1) selected++; break;
+            case '\n':
+            case '\r':
+            case KEY_ENTER: running = 0; break;
+            default:        break;
+        }
+    }
+
+    draw_ui(st);
+    return selected;
+}
 static char *pick_file(void) {
     int have_ff  = check_command_exists("ff");
     int have_fzf = check_command_exists("fzf");
@@ -3611,7 +3828,77 @@ static inline void insert_undo_maybe_push(ViewerState *st, Buffer *b) {
         st->insert_undo_armed = 1;
     }
 }
+static void show_def_popup(ViewerState *st) {
+    if (!check_command_exists("rg")) {
+        set_status(st, "ripgrep (rg) not found — needed for @ lookup");
+        return;
+    }
 
+    Buffer *b = &st->buffers[st->current_buffer];
+
+    char word[128] = {0};
+    if (!word_under_cursor(b->lines[st->cursor_line], st->cursor_col,
+                           word, sizeof(word)) || !word[0]) {
+        set_status(st, "No identifier under cursor");
+        return;
+    }
+
+    char cwd[2048];
+    buffer_cwd(b, cwd, sizeof(cwd));
+
+    char pattern[1024];
+    build_def_pattern(word, pattern, sizeof(pattern));
+
+    DefResult results[DEF_MAX_RESULTS];
+    int count = run_rg_for_def(cwd, pattern, b->filepath, results, DEF_MAX_RESULTS);
+
+    if (count == 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "No definitions found for '%s'", word);
+        set_status(st, msg);
+        return;
+    }
+
+    int sel = draw_def_popup(st, word, results, count);
+    if (sel < 0 || sel >= count) return;
+
+    const char *target_path = results[sel].filepath;
+    int target_line = results[sel].lineno - 1;
+    if (target_line < 0) target_line = 0;
+
+    char abs_path[2048];
+    if (target_path[0] == '/') {
+        snprintf(abs_path, sizeof(abs_path), "%s", target_path);
+    } else {
+        snprintf(abs_path, sizeof(abs_path), "%s/%s", cwd, target_path);
+    }
+
+    int found_buf = -1;
+    for (int i = 0; i < st->buffer_count; i++) {
+        if (strcmp(st->buffers[i].filepath, abs_path) == 0) { found_buf = i; break; }
+    }
+
+    if (found_buf >= 0) {
+        st->current_buffer = found_buf;
+    } else {
+        if (add_buffer_from_path(st, abs_path) != 0) {
+            if (add_buffer_from_path(st, target_path) != 0) {
+                set_status(st, "Could not open file");
+                return;
+            }
+        }
+    }
+
+    st->cursor_line = target_line;
+    st->cursor_col  = 0;
+    ensure_cursor_bounds(st);
+    ensure_cursor_visible(st);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg), "Jumped to '%s' in %s", word,
+             basename_path(st->buffers[st->current_buffer].filepath));
+    set_status(st, msg);
+}
 static void handle_input(ViewerState *st, int *running) {
     int ch = getch();
 
@@ -3948,6 +4235,9 @@ static void handle_input(ViewerState *st, int *running) {
             }
             return;
         }
+        case '@':
+            show_def_popup(st);
+            return;
         default:
             return;
     }
