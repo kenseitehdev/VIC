@@ -245,27 +245,35 @@ static void ansi_state_reset(AnsiState *st) {
     st->bold = st->ul = st->ital = 0;
 }
 
-static void ansi_state_apply(const AnsiState *st) {
+static void ansi_state_apply(const AnsiState *st, attr_t preserve) {
     short fg = (short)ansi_map_256_to_curses(st->fg);
     short bg = (short)ansi_map_256_to_curses(st->bg);
     short pair = ansi_get_pair(fg, bg);
-    attrset(COLOR_PAIR(pair));
+
+    /* Preserve selection reverse (and anything else you want later). */
+    attrset((preserve & A_REVERSE) | COLOR_PAIR(pair));
+
     if (st->bold) attron(A_BOLD);
     if (st->ul)   attron(A_UNDERLINE);
 #ifdef A_ITALIC
     if (st->ital) attron(A_ITALIC);
 #endif
 }
-
 static int ansi_clamp8(int x) { return (x < 0) ? 0 : (x > 7 ? 7 : x); }
 
 /* Draw a single line string that may contain ANSI escape sequences.
  * Uses ncurses mvaddch so it integrates with the rest of the TUI. */
 static void draw_ansi_line(const char *s, int y, int x, int max_x) {
     if (!s) return;
+
+    /* Capture whatever the caller set (Visual mode sets A_REVERSE). */
+    attr_t preserve = 0;
+    short  curpair = 0;
+    attr_get(&preserve, &curpair, NULL);
+
     AnsiState st;
     ansi_state_reset(&st);
-    ansi_state_apply(&st);
+    ansi_state_apply(&st, preserve);
 
     for (int i = 0; s[i] && x < max_x; ) {
         unsigned char c = (unsigned char)s[i];
@@ -288,7 +296,6 @@ static void draw_ansi_line(const char *s, int y, int x, int max_x) {
                     i++;
                     break;
                 } else {
-                    /* skip unknown CSI sequence */
                     while (s[i] && s[i] != 'm') i++;
                     if (s[i] == 'm') i++;
                     pn = 0;
@@ -296,7 +303,7 @@ static void draw_ansi_line(const char *s, int y, int x, int max_x) {
                 }
             }
 
-            if (pn == 0) { ansi_state_reset(&st); ansi_state_apply(&st); continue; }
+            if (pn == 0) { ansi_state_reset(&st); ansi_state_apply(&st, preserve); continue; }
 
             for (int k = 0; k < pn; k++) {
                 int p = params[k];
@@ -316,7 +323,8 @@ static void draw_ansi_line(const char *s, int y, int x, int max_x) {
                 else if (p == 38 && k + 2 < pn && params[k+1] == 5) { st.fg = params[k+2]; k += 2; }
                 else if (p == 48 && k + 2 < pn && params[k+1] == 5) { st.bg = params[k+2]; k += 2; }
             }
-            ansi_state_apply(&st);
+
+            ansi_state_apply(&st, preserve);
             continue;
         }
 
@@ -324,10 +332,9 @@ static void draw_ansi_line(const char *s, int y, int x, int max_x) {
         i++;
     }
 
-    /* restore default attrs after the line */
-    attrset(COLOR_PAIR(COLOR_NORMAL));
+    /* Restore normal, but keep reverse if caller had it on. */
+    attrset((preserve & A_REVERSE) | COLOR_PAIR(COLOR_NORMAL));
 }
-
 static int is_dir_path(const char *path) {
     if (!path || !*path) return 0;
     struct stat st;
