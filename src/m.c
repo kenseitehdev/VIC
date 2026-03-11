@@ -2933,7 +2933,7 @@ void tmux_toggle_db(const char *cwd) {
     shell_quote_single(qcwd, sizeof(qcwd), (cwd && *cwd) ? cwd : ".");
     {
         char cmd[4096];
-        snprintf(cmd, sizeof(cmd), "tmux split-window -h -p 40 -c %s 2>/dev/null", qcwd);
+        snprintf(cmd, sizeof(cmd), "tmux split-window -h -p 25 -c %s 2>/dev/null", qcwd);
         system(cmd);
     }
     {
@@ -3000,7 +3000,7 @@ void tmux_toggle_peek(const char *cwd) {
 
     {
         char cmd[4096];
-        snprintf(cmd, sizeof(cmd), "tmux split-window -h -p 30 -c %s 2>/dev/null", qcwd);
+        snprintf(cmd, sizeof(cmd), "tmux split-window -h -p 25 -c %s 2>/dev/null", qcwd);
         system(cmd);
     }
 
@@ -3036,7 +3036,7 @@ void tmux_toggle_peek(const char *cwd) {
 
         char split_cmd[512];
         snprintf(split_cmd, sizeof(split_cmd),
-                 "tmux split-window -t %s -v -p 30 -c %s 2>/dev/null",
+                 "tmux split-window -t %s -v -p 25 -c %s 2>/dev/null",
                  qnewpane, qcwd);
         system(split_cmd);
     }
@@ -4901,7 +4901,6 @@ int main(int argc, char *argv[]) {
     free(st);
     return 0;
 }
-
 
 
 
