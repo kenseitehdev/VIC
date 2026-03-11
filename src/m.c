@@ -16,9 +16,9 @@
 #include <sys/stat.h>
 #include <stdbool.h>
 
-#define MAX_BUFFERS   20
+#define MAX_BUFFERS   50
 #define INITIAL_LINE_CAP 1024
-#define MAX_LINE_LEN  2048
+#define MAX_LINE_LEN  8192
 
 #define CMDHIST_MAX   25
 
@@ -41,7 +41,7 @@ typedef enum {
     LANG_C, LANG_CPP, LANG_PYTHON, LANG_JAVA, LANG_JS, LANG_TS,
     LANG_HTML, LANG_CSS, LANG_SHELL, LANG_MARKDOWN, LANG_MAN,
     LANG_RUST, LANG_GO, LANG_RUBY, LANG_PHP, LANG_SQL, LANG_JSON,
-    LANG_XML, LANG_YAML
+    LANG_XML, LANG_YAML, LANG_XF
 } Language;
 
 typedef struct {
@@ -189,6 +189,7 @@ static const char *highlight_lang(Language l)
         case LANG_JSON: return "json";
         case LANG_XML: return "xml";
         case LANG_YAML: return "yaml";
+        case LANG_XF: return "xf";
         default: return "txt";
     }
 }
@@ -598,11 +599,10 @@ static char *pick_file(void) {
     if (has_fd) {
         if (have_ff) {
             snprintf(cmd, sizeof(cmd),
-                "fd -L -t f . "
-                "--exclude .git --exclude node_modules --exclude build --exclude dist --exclude .cache "
-                "2>/dev/null | ff > \"%s\" 2>/dev/null",
-                tmp_template
-            );
+"fd -L -I -t f . "
+"--exclude .git --exclude node_modules --exclude build --exclude dist --exclude .cache "
+"2>/dev/null | ff > \"%s\" 2>/dev/null",
+tmp_template            );
         } else {
             snprintf(cmd, sizeof(cmd),
                 "fd -L -t f . "
@@ -1018,6 +1018,7 @@ static Language detect_language(const char *filepath) {
     if (strcmp(ext, ".sql") == 0) return LANG_SQL;
     if (strcmp(ext, ".json") == 0) return LANG_JSON;
     if (strcmp(ext, ".xml") == 0) return LANG_XML;
+    if (strcmp(ext, ".xf")==0) return LANG_XF;
     if (strcmp(ext, ".yaml") == 0 || strcmp(ext, ".yml") == 0) return LANG_YAML;
     if (strstr(filepath, "/man/") || strstr(filepath, ".man")) return LANG_MAN;
     return LANG_NONE;
@@ -1060,74 +1061,143 @@ static int is_printable_cell(unsigned char c) {
     // We treat tabs as 1 cell to keep it simple (your editor likely expands elsewhere).
     return (c >= 0x20 && c != 0x7F);
 }
+static void ansi_state_to_sgr(const AnsiState *st, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+
+    size_t len = 0;
+    int first = 1;
+
+    len += (size_t)snprintf(out + len, out_sz - len, "\x1b[0");
+
+    if (st->bold && len < out_sz) {
+        len += (size_t)snprintf(out + len, out_sz - len, ";1");
+        first = 0;
+    }
+    if (st->ital && len < out_sz) {
+        len += (size_t)snprintf(out + len, out_sz - len, ";3");
+        first = 0;
+    }
+    if (st->ul && len < out_sz) {
+        len += (size_t)snprintf(out + len, out_sz - len, ";4");
+        first = 0;
+    }
+
+    if (st->fg >= 0 && len < out_sz) {
+        len += (size_t)snprintf(out + len, out_sz - len, ";38;5;%d", st->fg);
+        first = 0;
+    }
+    if (st->bg >= 0 && len < out_sz) {
+        len += (size_t)snprintf(out + len, out_sz - len, ";48;5;%d", st->bg);
+        first = 0;
+    }
+
+    (void)first;
+    if (len < out_sz) {
+        snprintf(out + len, out_sz - len, "m");
+    } else {
+        out[out_sz - 1] = '\0';
+    }
+}
+
+static void ansi_state_apply_params(AnsiState *st, const int *params, int pn) {
+    if (!st) return;
+
+    if (pn == 0) {
+        ansi_state_reset(st);
+        return;
+    }
+
+    for (int k = 0; k < pn; k++) {
+        int p = params[k];
+
+        if      (p == 0)  ansi_state_reset(st);
+        else if (p == 1)  st->bold = 1;
+        else if (p == 3)  st->ital = 1;
+        else if (p == 4)  st->ul   = 1;
+        else if (p == 22) st->bold = 0;
+        else if (p == 23) st->ital = 0;
+        else if (p == 24) st->ul   = 0;
+        else if (p >= 30 && p <= 37) st->fg = ansi_clamp8(p - 30);
+        else if (p == 39) st->fg = -1;
+        else if (p >= 40 && p <= 47) st->bg = ansi_clamp8(p - 40);
+        else if (p == 49) st->bg = -1;
+        else if (p >= 90 && p <= 97)  st->fg = ansi_clamp8(p - 90) + 8;
+        else if (p >= 100 && p <= 107) st->bg = ansi_clamp8(p - 100) + 8;
+        else if (p == 38 && k + 2 < pn && params[k + 1] == 5) {
+            st->fg = params[k + 2];
+            k += 2;
+        }
+        else if (p == 48 && k + 2 < pn && params[k + 1] == 5) {
+            st->bg = params[k + 2];
+            k += 2;
+        }
+    }
+}
 
 static WrappedLine ansi_wrap_line(const char *line, int width) {
     WrappedLine out = (WrappedLine){0, NULL};
     if (!line || width <= 0) return out;
 
-    // dynamic segment list
     int seg_cap = 8;
-    out.segments = (char**)calloc((size_t)seg_cap, sizeof(char*));
+    out.segments = (char **)calloc((size_t)seg_cap, sizeof(char *));
     if (!out.segments) return (WrappedLine){0, NULL};
 
-    // current segment buffer
     size_t buf_cap = 256;
     size_t buf_len = 0;
-    char *buf = (char*)malloc(buf_cap);
-    if (!buf) { free(out.segments); return (WrappedLine){0, NULL}; }
+    char *buf = (char *)malloc(buf_cap);
+    if (!buf) {
+        free(out.segments);
+        return (WrappedLine){0, NULL};
+    }
     buf[0] = '\0';
 
-    // Track the "current" SGR state as the last CSI ... m sequence seen.
-    // We replay it at the start of a new wrapped segment.
-    char cur_sgr[128];
-    cur_sgr[0] = '\0';
+    AnsiState st;
+    ansi_state_reset(&st);
+
+    char replay_sgr[128];
+    replay_sgr[0] = '\0';
 
     int cells = 0;
 
-    // helper to append bytes to buf
-    #define APPEND_BYTES(ptr, nbytes) do { \
-        size_t _n = (size_t)(nbytes); \
-        if (buf_len + _n + 1 > buf_cap) { \
-            while (buf_len + _n + 1 > buf_cap) buf_cap *= 2; \
-            char *_nb = (char*)realloc(buf, buf_cap); \
-            if (!_nb) goto oom; \
-            buf = _nb; \
-        } \
-        memcpy(buf + buf_len, (ptr), _n); \
-        buf_len += _n; \
-        buf[buf_len] = '\0'; \
-    } while (0)
+#define APPEND_BYTES(ptr, nbytes) do { \
+    size_t _n = (size_t)(nbytes); \
+    if (buf_len + _n + 1 > buf_cap) { \
+        while (buf_len + _n + 1 > buf_cap) buf_cap *= 2; \
+        char *_nb = (char *)realloc(buf, buf_cap); \
+        if (!_nb) goto oom; \
+        buf = _nb; \
+    } \
+    memcpy(buf + buf_len, (ptr), _n); \
+    buf_len += _n; \
+    buf[buf_len] = '\0'; \
+} while (0)
 
-    // helper to flush segment
-    #define FLUSH_SEG() do { \
-        if (out.count >= seg_cap) { \
-            int _nc = seg_cap * 2; \
-            char **_ns = (char**)realloc(out.segments, (size_t)_nc * sizeof(char*)); \
-            if (!_ns) goto oom; \
-            out.segments = _ns; \
-            memset(out.segments + seg_cap, 0, (size_t)(seg_cap) * sizeof(char*)); \
-            seg_cap = _nc; \
-        } \
-        out.segments[out.count++] = safe_strdup(buf_len ? buf : ""); \
-        buf_len = 0; \
-        buf[0] = '\0'; \
-        cells = 0; \
-        if (cur_sgr[0]) { \
-            APPEND_BYTES(cur_sgr, strlen(cur_sgr)); \
-        } \
-    } while (0)
-
-    // Start segment with current sgr (none initially)
-    // (nothing to do)
+#define FLUSH_SEG() do { \
+    if (out.count >= seg_cap) { \
+        int _nc = seg_cap * 2; \
+        char **_ns = (char **)realloc(out.segments, (size_t)_nc * sizeof(char *)); \
+        if (!_ns) goto oom; \
+        out.segments = _ns; \
+        memset(out.segments + seg_cap, 0, (size_t)(seg_cap) * sizeof(char *)); \
+        seg_cap = _nc; \
+    } \
+    out.segments[out.count++] = safe_strdup(buf_len ? buf : ""); \
+    buf_len = 0; \
+    buf[0] = '\0'; \
+    cells = 0; \
+    ansi_state_to_sgr(&st, replay_sgr, sizeof(replay_sgr)); \
+    if (replay_sgr[0]) { \
+        APPEND_BYTES(replay_sgr, strlen(replay_sgr)); \
+    } \
+} while (0)
 
     for (int i = 0; line[i]; ) {
         unsigned char c = (unsigned char)line[i];
 
-        // ANSI escape
         if (c == 0x1B) {
             int n = 0;
 
-            if (line[i+1] == ']') {
+            if (line[i + 1] == ']') {
                 n = ansi_seq_len_osc(line + i);
                 if (n <= 0) n = 1;
                 APPEND_BYTES(line + i, n);
@@ -1135,16 +1205,37 @@ static WrappedLine ansi_wrap_line(const char *line, int width) {
                 continue;
             }
 
-            if (line[i+1] == '[') {
+            if (line[i + 1] == '[') {
                 n = ansi_seq_len_csi(line + i);
                 if (n <= 0) n = 1;
 
-                // If this is an SGR (ends with 'm'), capture it as current state.
                 if (n > 2 && line[i + n - 1] == 'm') {
-                    int copy = n;
-                    if (copy >= (int)sizeof(cur_sgr)) copy = (int)sizeof(cur_sgr) - 1;
-                    memcpy(cur_sgr, line + i, (size_t)copy);
-                    cur_sgr[copy] = '\0';
+                    int params[16];
+                    int pn = 0;
+                    int val = 0;
+                    int have = 0;
+
+                    int j = i + 2;
+                    while (j < i + n - 1 && pn < 16) {
+                        if (isdigit((unsigned char)line[j])) {
+                            val = val * 10 + (line[j] - '0');
+                            have = 1;
+                            j++;
+                        } else if (line[j] == ';') {
+                            params[pn++] = have ? val : 0;
+                            val = 0;
+                            have = 0;
+                            j++;
+                        } else {
+                            j++;
+                        }
+                    }
+                    if (pn < 16) {
+                        params[pn++] = have ? val : 0;
+                    }
+
+                    ansi_state_apply_params(&st, params, pn);
+                    ansi_state_to_sgr(&st, replay_sgr, sizeof(replay_sgr));
                 }
 
                 APPEND_BYTES(line + i, n);
@@ -1152,19 +1243,15 @@ static WrappedLine ansi_wrap_line(const char *line, int width) {
                 continue;
             }
 
-            // unknown ESC sequence: just copy ESC
             APPEND_BYTES(line + i, 1);
             i += 1;
             continue;
         }
 
-        // newline shouldn't exist here (your input is line-based), but break if it does
         if (c == '\n' || c == '\r') break;
 
-        // printable char counts toward wrap width
         if (is_printable_cell(c)) {
             if (cells >= width) {
-                // end this segment and start a new one
                 FLUSH_SEG();
             }
             APPEND_BYTES(line + i, 1);
@@ -1173,15 +1260,13 @@ static WrappedLine ansi_wrap_line(const char *line, int width) {
             continue;
         }
 
-        // control char: copy but don't count
         APPEND_BYTES(line + i, 1);
         i++;
     }
 
-    // flush last segment
     if (buf_len > 0 || out.count == 0) {
         if (out.count >= seg_cap) {
-            char **_ns = (char**)realloc(out.segments, (size_t)(seg_cap + 1) * sizeof(char*));
+            char **_ns = (char **)realloc(out.segments, (size_t)(seg_cap + 1) * sizeof(char *));
             if (!_ns) goto oom;
             out.segments = _ns;
         }
@@ -1192,66 +1277,88 @@ static WrappedLine ansi_wrap_line(const char *line, int width) {
     return out;
 
 oom:
-    if (buf) free(buf);
+    free(buf);
     if (out.segments) {
         for (int k = 0; k < out.count; k++) free(out.segments[k]);
         free(out.segments);
     }
     return (WrappedLine){0, NULL};
 
-    #undef APPEND_BYTES
-    #undef FLUSH_SEG
+#undef APPEND_BYTES
+#undef FLUSH_SEG
 }
 static WrappedLine wrap_line(const char *line, int width) {
     WrappedLine result = (WrappedLine){0, NULL};
     if (!line || width <= 0) return result;
 
-    const size_t len = strlen(line);
+    int seg_cap = 8;
+    result.segments = (char**)calloc((size_t)seg_cap, sizeof(char*));
+    if (!result.segments) return result;
 
-    size_t max_segments = (len / (size_t)width) + 2;
-    if (max_segments < 1) max_segments = 1;
+    const char *p = line;
 
-    result.segments = (char**)calloc(max_segments, sizeof(char*));
-    if (!result.segments) return (WrappedLine){0, NULL};
+    while (*p) {
+        const char *start = p;
+        const char *end = p;
+        int cells = 0;
 
-    if (len == 0) {
-        result.segments[0] = safe_strdup("");
-        if (!result.segments[0]) { free(result.segments); return (WrappedLine){0, NULL}; }
-        result.count = 1;
-        return result;
-    }
+        while (*end) {
+            unsigned char c = (unsigned char)*end;
+            int add = 1;
+            int adv = 1;
 
-    size_t pos = 0;
-    while (pos < len) {
-        if ((size_t)result.count >= max_segments) {
-            break;
+            if (c == '\t') {
+                add = 4 - (cells % 4);
+                adv = 1;
+            } else if (c < 0x80) {
+                add = 1;
+                adv = 1;
+            } else if ((c & 0xE0) == 0xC0) {
+                add = 1;
+                adv = 2;
+            } else if ((c & 0xF0) == 0xE0) {
+                add = 1;
+                adv = 3;
+            } else if ((c & 0xF8) == 0xF0) {
+                add = 1;
+                adv = 4;
+            }
+
+            if (cells + add > width && end > start) break;
+
+            cells += add;
+            end += adv;
         }
 
-        size_t remaining = len - pos;
-        size_t take = (remaining > (size_t)width) ? (size_t)width : remaining;
+        size_t len = (size_t)(end - start);
+        char *seg = (char*)malloc(len + 1);
+        if (!seg) break;
 
-        char *seg = (char*)malloc(take + 1);
-        if (!seg) {
-            for (int i = 0; i < result.count; i++) free(result.segments[i]);
-            free(result.segments);
-            return (WrappedLine){0, NULL};
+        memcpy(seg, start, len);
+        seg[len] = '\0';
+
+        if (result.count >= seg_cap) {
+            int new_cap = seg_cap * 2;
+            char **ns = (char**)realloc(result.segments, (size_t)new_cap * sizeof(char*));
+            if (!ns) {
+                free(seg);
+                break;
+            }
+            result.segments = ns;
+            seg_cap = new_cap;
         }
 
-        memcpy(seg, line + pos, take);
-        seg[take] = '\0';
         result.segments[result.count++] = seg;
-        pos += take;
+        p = end;
     }
 
     if (result.count == 0) {
         result.segments[0] = safe_strdup("");
-        if (!result.segments[0]) { free(result.segments); return (WrappedLine){0, NULL}; }
         result.count = 1;
     }
 
     return result;
 }
-
 static void free_wrapped_line(WrappedLine *wl) {
     if (!wl || !wl->segments) return;
     for (int i = 0; i < wl->count; i++) free(wl->segments[i]);
@@ -1550,10 +1657,6 @@ static int load_raw_via_highlight(Buffer *b, const char *filepath) {
     char cmd[8192];
     const char *lang = (b->lang != LANG_NONE) ? highlight_lang(b->lang) : NULL;
 
-    /*
-     * Always provide --path when we can; it helps your tool autodetect extension
-     * and also gives it context even if stdin is used.
-     */
     if (lang && *lang) {
         snprintf(cmd, sizeof(cmd),
                  "highlight --force-color --lang %s --path %s < %s 2>/dev/null",
@@ -1567,24 +1670,19 @@ static int load_raw_via_highlight(Buffer *b, const char *filepath) {
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
 
-    /*
-     * Collect highlighted output lines. Do NOT rtrim() them; preserve whitespace.
-     * We only strip newline terminators (\n/\r\n).
-     */
     int cap = (b->line_count > 0 ? b->line_count : 1) + 8;
     char **tmp = (char**)calloc((size_t)cap, sizeof(char*));
-    if (!tmp) { pclose(p); return -1; }
+    if (!tmp) {
+        pclose(p);
+        return -1;
+    }
 
     int count = 0;
     int has_ansi = 0;
-
-    /* NOTE: MAX_LINE_LEN truncates; that's fine—editor lines are capped anyway. */
     char line[MAX_LINE_LEN];
 
     while (fgets(line, sizeof(line), p)) {
         size_t len = strlen(line);
-
-        /* strip newline(s) only */
         while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
             line[--len] = '\0';
         }
@@ -1598,7 +1696,6 @@ static int load_raw_via_highlight(Buffer *b, const char *filepath) {
                 pclose(p);
                 return -1;
             }
-            /* ensure new slots are zeroed */
             memset(nt + cap, 0, (size_t)(new_cap - cap) * sizeof(char*));
             tmp = nt;
             cap = new_cap;
@@ -1611,50 +1708,33 @@ static int load_raw_via_highlight(Buffer *b, const char *filepath) {
 
     int rc = pclose(p);
 
-    /* If the command failed and produced no output, treat as failure. */
     if (count == 0 && rc != 0) {
         free(tmp);
         return -1;
     }
 
-    /* Ensure raw capacity for at least b->line_count (we'll map partial). */
+    /* STRICT 1:1 line mapping required */
+    if (count != b->line_count) {
+        for (int i = 0; i < count; i++) free(tmp[i]);
+        free(tmp);
+        return -1;
+    }
+
     if (!buf_ensure_raw_capacity(b, b->line_count)) {
         for (int i = 0; i < count; i++) free(tmp[i]);
         free(tmp);
         return -1;
     }
 
-    /*
-     * Commit (partial): replace as many lines as we have.
-     * If highlight returns fewer lines than the buffer, keep existing raw_lines
-     * for the remainder (or you can set them to NULL; renderer should fall back).
-     */
-    int n = count;
-    if (n > b->line_count) n = b->line_count;
-
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < b->line_count; i++) {
         free(b->raw_lines[i]);
         b->raw_lines[i] = tmp[i];
         tmp[i] = NULL;
     }
 
-    /* Free any extra highlighted lines we didn’t use. */
-    for (int i = n; i < count; i++) {
-        free(tmp[i]);
-        tmp[i] = NULL;
-    }
     free(tmp);
-
-    /*
-     * If we saw ANSI anywhere, enable ANSI rendering. This is the key switch
-     * that prevents falling back to curses highlighting.
-     */
     b->raw_has_ansi = has_ansi ? 1 : 0;
-
-    /* Success if we mapped at least one line OR highlight exited cleanly. */
-    if (n > 0) return 0;
-    if (rc == 0) return 0;
-    return -1;
+    return 0;
 }
 static int load_file(Buffer *b, const char *filepath) {
     if (!file_exists(filepath)) {
@@ -1962,16 +2042,74 @@ static int text_width_for(ViewerState *st) {
     if (w < 1) w = 1;
     return w;
 }
+static int visual_width_line(const char *line) {
+    if (!line || !*line) return 0;
 
+    int cells = 0;
+    for (int i = 0; line[i]; ) {
+        unsigned char c = (unsigned char)line[i];
+
+        if (c == '\t') {
+            cells += 4 - (cells % 4);
+            i++;
+            continue;
+        }
+
+        if (c < 0x80) {
+            cells++;
+            i++;
+            continue;
+        }
+
+        if ((c & 0xE0) == 0xC0) i += 2;
+        else if ((c & 0xF0) == 0xE0) i += 3;
+        else if ((c & 0xF8) == 0xF0) i += 4;
+        else i++;
+
+        cells++;
+    }
+
+    return cells;
+}
+static int visual_width_until(const char *s, int stop_byte) {
+    if (!s || stop_byte <= 0) return 0;
+
+    int cells = 0;
+    int i = 0;
+
+    while (s[i] && i < stop_byte) {
+        unsigned char c = (unsigned char)s[i];
+
+        if (c == '\t') {
+            cells += 4 - (cells % 4);
+            i++;
+            continue;
+        }
+
+        if (c < 0x80) {
+            cells++;
+            i++;
+            continue;
+        }
+
+        if ((c & 0xE0) == 0xC0) i += 2;
+        else if ((c & 0xF0) == 0xE0) i += 3;
+        else if ((c & 0xF8) == 0xF0) i += 4;
+        else i++;
+
+        cells++;
+    }
+
+    return cells;
+}
 static int wrapped_rows_for_line(ViewerState *st, const char *line) {
     if (!st->wrap_enabled) return 1;
     int w = text_width_for(st);
-    int len = (int)strlen(line);
-    int rows = (len <= 0) ? 1 : ((len + w - 1) / w);
+    int cells = visual_width_line(line);
+    int rows = (cells <= 0) ? 1 : ((cells + w - 1) / w);
     if (rows < 1) rows = 1;
     return rows;
 }
-
 static void ensure_cursor_visible(ViewerState *st) {
     Buffer *b = &st->buffers[st->current_buffer];
     int h = content_height();
@@ -3236,7 +3374,175 @@ static void draw_status_bar(ViewerState *st) {
 
     attroff(COLOR_PAIR(COLOR_STATUS) | A_BOLD);
 }
+static char *ansi_slice_for_plain_range(const char *raw, int byte_start, int byte_len) {
+    if (!raw || byte_len <= 0) return NULL;
 
+    size_t out_cap = strlen(raw) + 64;
+    char *out = (char*)malloc(out_cap);
+    if (!out) return NULL;
+    size_t out_len = 0;
+    out[0] = '\0';
+
+    AnsiState st;
+    ansi_state_reset(&st);
+
+    int plain_byte = 0;
+    int in_range = 0;
+    int emitted_prefix = 0;
+    int remaining = byte_len;
+
+    for (int i = 0; raw[i]; ) {
+        unsigned char c = (unsigned char)raw[i];
+
+        if (c == 0x1B) {
+            if (raw[i + 1] == '[') {
+                int n = ansi_seq_len_csi(raw + i);
+                if (n <= 0) n = 1;
+
+                if (n > 2 && raw[i + n - 1] == 'm') {
+                    int params[16];
+                    int pn = 0;
+                    int val = 0;
+                    int have = 0;
+                    int j = i + 2;
+
+                    while (j < i + n - 1 && pn < 16) {
+                        if (isdigit((unsigned char)raw[j])) {
+                            val = val * 10 + (raw[j] - '0');
+                            have = 1;
+                            j++;
+                        } else if (raw[j] == ';') {
+                            params[pn++] = have ? val : 0;
+                            val = 0;
+                            have = 0;
+                            j++;
+                        } else {
+                            j++;
+                        }
+                    }
+                    if (pn < 16) params[pn++] = have ? val : 0;
+                    ansi_state_apply_params(&st, params, pn);
+                }
+
+                if (in_range) {
+                    if (out_len + (size_t)n + 1 > out_cap) {
+                        while (out_len + (size_t)n + 1 > out_cap) out_cap *= 2;
+                        char *nb = (char*)realloc(out, out_cap);
+                        if (!nb) { free(out); return NULL; }
+                        out = nb;
+                    }
+                    memcpy(out + out_len, raw + i, (size_t)n);
+                    out_len += (size_t)n;
+                    out[out_len] = '\0';
+                }
+
+                i += n;
+                continue;
+            }
+
+            if (raw[i + 1] == ']') {
+                int n = ansi_seq_len_osc(raw + i);
+                if (n <= 0) n = 1;
+
+                if (in_range) {
+                    if (out_len + (size_t)n + 1 > out_cap) {
+                        while (out_len + (size_t)n + 1 > out_cap) out_cap *= 2;
+                        char *nb = (char*)realloc(out, out_cap);
+                        if (!nb) { free(out); return NULL; }
+                        out = nb;
+                    }
+                    memcpy(out + out_len, raw + i, (size_t)n);
+                    out_len += (size_t)n;
+                    out[out_len] = '\0';
+                }
+
+                i += n;
+                continue;
+            }
+
+            if (in_range) {
+                if (out_len + 2 > out_cap) {
+                    out_cap *= 2;
+                    char *nb = (char*)realloc(out, out_cap);
+                    if (!nb) { free(out); return NULL; }
+                    out = nb;
+                }
+                out[out_len++] = raw[i];
+                out[out_len] = '\0';
+            }
+
+            i++;
+            continue;
+        }
+
+        int adv = 1;
+        if (c >= 0x80) {
+            if ((c & 0xE0) == 0xC0) adv = 2;
+            else if ((c & 0xF0) == 0xE0) adv = 3;
+            else if ((c & 0xF8) == 0xF0) adv = 4;
+        }
+
+        if (plain_byte >= byte_start && !emitted_prefix) {
+            char prefix[128];
+            ansi_state_to_sgr(&st, prefix, sizeof(prefix));
+            size_t plen = strlen(prefix);
+
+            if (out_len + plen + 1 > out_cap) {
+                while (out_len + plen + 1 > out_cap) out_cap *= 2;
+                char *nb = (char*)realloc(out, out_cap);
+                if (!nb) { free(out); return NULL; }
+                out = nb;
+            }
+
+            memcpy(out + out_len, prefix, plen);
+            out_len += plen;
+            out[out_len] = '\0';
+
+            emitted_prefix = 1;
+            in_range = 1;
+        }
+
+        if (in_range && remaining > 0) {
+            if (out_len + (size_t)adv + 1 > out_cap) {
+                while (out_len + (size_t)adv + 1 > out_cap) out_cap *= 2;
+                char *nb = (char*)realloc(out, out_cap);
+                if (!nb) { free(out); return NULL; }
+                out = nb;
+            }
+
+            memcpy(out + out_len, raw + i, (size_t)adv);
+            out_len += (size_t)adv;
+            out[out_len] = '\0';
+
+            remaining -= adv;
+            if (remaining <= 0) break;
+        }
+
+        i += adv;
+        plain_byte += adv;
+    }
+
+    if (!emitted_prefix || out_len == 0) {
+        free(out);
+        return NULL;
+    }
+
+    {
+        const char *reset = "\x1b[0m";
+        size_t rlen = strlen(reset);
+        if (out_len + rlen + 1 > out_cap) {
+            while (out_len + rlen + 1 > out_cap) out_cap *= 2;
+            char *nb = (char*)realloc(out, out_cap);
+            if (!nb) { free(out); return NULL; }
+            out = nb;
+        }
+        memcpy(out + out_len, reset, rlen);
+        out_len += rlen;
+        out[out_len] = '\0';
+    }
+
+    return out;
+}
 static void draw_buffer(ViewerState *st) {
     if (!st) return;
 
@@ -3247,12 +3553,7 @@ static void draw_buffer(ViewerState *st) {
     const int line_nr_width = line_nr_width_for(st);
     const int start_x       = line_nr_width + 1;
     const int do_search_hl  = (st->search_highlight && st->search_term[0] != '\0');
-
-    /* Use external ANSI highlighting only when wrap is OFF.
-     * When wrap is ON we use plain lines because wrap_line() splits on byte
-     * boundaries and would corrupt mid-sequence escape codes.  The internal
-     * highlight_line() fallback still provides decent colouring in that case. */
-    const int use_ansi = b->raw_has_ansi;
+    const int use_ansi      = b->raw_has_ansi;
 
     for (int y = 0; y < h; y++) {
         move(y, 0);
@@ -3294,52 +3595,61 @@ static void draw_buffer(ViewerState *st) {
         return;
     }
 
-    /* Wrapped rendering.
-     * We wrap using plain b->lines[] (safe byte boundaries for geometry).
-     * If ANSI is available, we render b->raw_lines[] segments via draw_ansi_line;
-     * otherwise fall back to internal highlight_line(). */
-    const int text_w = text_width_for(st);
+    {
+        const int text_w = text_width_for(st);
+        int y = 0;
+        int logical = b->scroll_offset;
+        if (logical < 0) logical = 0;
 
-    int y = 0;
-    int logical = b->scroll_offset;
-    if (logical < 0) logical = 0;
+        while (y < h && logical < b->line_count) {
+            WrappedLine wl = wrap_line(b->lines[logical], text_w);
+            const int in_sel = (st->mode == MODE_VISUAL && logical >= sel_lo && logical <= sel_hi);
 
-    while (y < h && logical < b->line_count) {
-        /* Always wrap the plain line for correct geometry */
-        WrappedLine wl = wrap_line(b->lines[logical], text_w);
+            int byte_off = 0;
 
-WrappedLine wl_raw = (WrappedLine){0, NULL};
-if (use_ansi && b->raw_lines && b->raw_lines[logical]) {
-    wl_raw = ansi_wrap_line(b->raw_lines[logical], text_w);
-}
-        const int in_sel = (st->mode == MODE_VISUAL && logical >= sel_lo && logical <= sel_hi);
-
-        for (int seg = 0; seg < wl.count && y < h; seg++) {
-            if (st->show_line_numbers) {
-                if (seg == 0) {
-                    attron(COLOR_PAIR(COLOR_LINENR));
-                    mvprintw(y, 1, "%4d ", logical + 1);
-                    attroff(COLOR_PAIR(COLOR_LINENR));
-                } else {
-                    mvprintw(y, 1, "     ");
+            for (int seg = 0; seg < wl.count && y < h; seg++) {
+                if (st->show_line_numbers) {
+                    if (seg == 0) {
+                        attron(COLOR_PAIR(COLOR_LINENR));
+                        mvprintw(y, 1, "%4d ", logical + 1);
+                        attroff(COLOR_PAIR(COLOR_LINENR));
+                    } else {
+                        mvprintw(y, 1, "     ");
+                    }
                 }
+
+                if (in_sel) attron(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
+
+                if (use_ansi && b->raw_lines && b->raw_lines[logical]) {
+                    int seg_byte_len = (int)strlen(wl.segments[seg]);
+                    char *ansi_seg = ansi_slice_for_plain_range(
+                        b->raw_lines[logical],
+                        byte_off,
+                        seg_byte_len
+                    );
+
+                    if (ansi_seg) {
+                        draw_ansi_line(ansi_seg, y, start_x, max_x);
+                        free(ansi_seg);
+                    } else {
+                        highlight_line(wl.segments[seg], b->lang, y, start_x, max_x,
+                                       st->search_term, do_search_hl);
+                    }
+
+                    byte_off += seg_byte_len;
+                } else {
+                    highlight_line(wl.segments[seg], b->lang, y, start_x, max_x,
+                                   st->search_term, do_search_hl);
+                    byte_off += (int)strlen(wl.segments[seg]);
+                }
+
+                if (in_sel) attroff(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
+                y++;
             }
 
-            if (in_sel) attron(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
-            if (use_ansi && wl_raw.segments && seg < wl_raw.count) {
-                draw_ansi_line(wl_raw.segments[seg], y, start_x, max_x);
-            } else {
-                highlight_line(wl.segments[seg], b->lang, y, start_x, max_x,
-                               st->search_term, do_search_hl);
-            }
-            if (in_sel) attroff(COLOR_PAIR(COLOR_COPY_SELECT) | A_REVERSE);
-
-            y++;
+            free_wrapped_line(&wl);
+            logical++;
         }
-
-        free_wrapped_line(&wl);
-        if (wl_raw.segments) free_wrapped_line(&wl_raw);
-        logical++;
     }
 }
 
@@ -3355,15 +3665,18 @@ static void cursor_to_screen(ViewerState *st, int *out_y, int *out_x) {
         y = st->cursor_line - b->scroll_offset;
         if (y < 0) y = 0;
         if (y >= h) y = h - 1;
-        x = line_nr_width + 1 + st->cursor_col;
+        x = line_nr_width + 1 + visual_width_until(b->lines[st->cursor_line], st->cursor_col);
     } else {
         int w = text_width_for(st);
         int row = 0;
         for (int L = b->scroll_offset; L < st->cursor_line && L < b->line_count; L++) {
             row += wrapped_rows_for_line(st, b->lines[L]);
         }
-        int seg = (w > 0) ? (st->cursor_col / w) : 0;
-        int segcol = (w > 0) ? (st->cursor_col % w) : 0;
+
+        int cells = visual_width_until(b->lines[st->cursor_line], st->cursor_col);
+        int seg = (w > 0) ? (cells / w) : 0;
+        int segcol = (w > 0) ? (cells % w) : 0;
+
         row += seg;
         y = row;
         if (y < 0) y = 0;
@@ -3377,7 +3690,6 @@ static void cursor_to_screen(ViewerState *st, int *out_y, int *out_x) {
     *out_y = y;
     *out_x = x;
 }
-
 static void draw_ui(ViewerState *st) {
     draw_buffer(st);
     draw_status_bar(st);
@@ -4589,3 +4901,7 @@ int main(int argc, char *argv[]) {
     free(st);
     return 0;
 }
+
+
+
+
